@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Join lobby, wait for start, claim task, train XOR, prove (Groth16), auto-wait for rewards."""
-import json, os, subprocess, tempfile, pathlib, time
+"""Join lobby, wait for start, claim task, train XOR, prove (Groth16),
+auto-settlement on last proof, then withdraw payout."""
+import json, os, subprocess, tempfile, pathlib, time, hashlib
 from web3 import Web3, HTTPProvider
 from eth_account import Account
 import torch, torch.nn as nn
@@ -18,7 +19,10 @@ ABI_PATH  = pathlib.Path("../artifacts/contracts/AiOrchestrator.sol/AiOrchestrat
 assert ORCH_ADDR and PRIV, "ORCH_ADDR & PRIVATE_KEY required"
 
 # ───────── helpers (mirror circuit)
-bin1   = lambda v: 1 if v >= 0 else 0        # clamp to {0,1}
+def bin01_list(tensor_flat):
+    # IMPORTANT: no rounding and strict > 0.0 threshold
+    return [1 if float(v) > 0.0 else 0 for v in tensor_flat]
+
 clamp3 = lambda x: min(max(int(x), 0), 3)    # 0..3 for Step()
 
 def xor_forward(x0, x1, wIH, bH, bO):
@@ -43,30 +47,38 @@ def send_tx(tx):
 addr = acct.address
 print(f"[worker:{addr}] joining lobby for request {REQ_ID}…")
 
-# 0) join the lobby (blocks on-chain until included)
+# 0) join the lobby
 join = orch.functions.joinLobby(REQ_ID).build_transaction({
-    "from": addr, "gas": 150_000, "gasPrice": w3.eth.gas_price,
-    "nonce": w3.eth.get_transaction_count(addr),
+    "from": addr,
+    "gas": 150_000,
+    "gasPrice": w3.eth.gas_price,
+    "nonce": w3.eth.get_transaction_count(addr, 'pending'),
 })
 send_tx(join)
 
-# 0b) poll until lobby is ready
+# 0b) poll until lobby is ready (needs exactly grid.length workers)
 while True:
     needed, joined, ready = orch.functions.lobbyCounts(REQ_ID).call()
     print(f"   lobby: {joined}/{needed} ready={ready}")
     if ready: break
-    time.sleep(2)
+    time.sleep(3)
 
 # 1) claim assigned task index
 claim = orch.functions.claimTask(REQ_ID).build_transaction({
-    "from": addr, "gas": 150_000, "gasPrice": w3.eth.gas_price,
-    "nonce": w3.eth.get_transaction_count(addr),
+    "from": addr,
+    "gas": 150_000,
+    "gasPrice": w3.eth.gas_price,
+    "nonce": w3.eth.get_transaction_count(addr, 'pending'),
 })
-rcpt = send_tx(claim)
-# decode topic if you want; simpler: ask contract who you are
+send_tx(claim)
 idx = orch.functions.taskOf(REQ_ID, addr).call()
 lr_ppm, steps = orch.functions.getSpace(REQ_ID).call()[idx]
 print(f"[worker:{addr}] idx={idx}, lr_ppm={lr_ppm}, steps={steps}")
+
+# Deterministic seed per hyper-parameter (so same (lr,steps) -> same binarized model)
+seed_src = f"{lr_ppm}:{steps}".encode()
+seed = int.from_bytes(hashlib.sha256(seed_src).digest()[:8], "big")
+torch.manual_seed(seed)
 
 # 2) train small MLP on XOR
 X = torch.tensor([[0,0],[1,0],[0,1],[1,1]], dtype=torch.float32)
@@ -80,9 +92,11 @@ for _ in range(steps):
     opt.zero_grad(); crit(net(X),y).backward(); opt.step()
 
 # 3) binarise & compute circuit-compatible accuracy
-wIH = [bin1(v) for v in net[0].weight.detach().round().flatten().tolist()]  # 4 ints in {0,1}
-bH  = [bin1(v) for v in net[0].bias.detach().round().tolist()]              # 2 ints in {0,1}
-bO  = 1                                                                      # avoid negatives
+w_flat = net[0].weight.detach().flatten().tolist()
+b_flat = net[0].bias.detach().flatten().tolist()
+wIH = bin01_list(w_flat)          # 4 ints in {0,1}
+bH  = bin01_list(b_flat)          # 2 ints in {0,1}
+bO  = 1                           # avoid negatives
 
 preds   = [xor_forward(*xy, wIH, bH, bO) for xy in [(0,0),(1,0),(0,1),(1,1)]]
 correct = sum(int(p==t) for p,t in zip(preds, [0,1,1,0]))
@@ -131,23 +145,50 @@ b = [
 c = [int(proof["pi_c"][0]), int(proof["pi_c"][1])]
 print("   pubSignals (lr,steps,acc_bps):", public_signals)
 
-submit = orch.functions.submitProof(REQ_ID, a, b, c, public_signals).build_transaction({
-    "from": addr, "gas": 600_000, "gasPrice": w3.eth.gas_price,
-    "nonce": w3.eth.get_transaction_count(addr),
-})
-rcpt = send_tx(submit)
-print(f"   ✓ proof submitted in tx {rcpt['transactionHash'].hex()}")
+fn = orch.functions.submitProof(REQ_ID, a, b, c, public_signals)
 
-# 6) wait for auto-settlement & print rewards
+# --- NEW: estimate gas, then add safety margin ---
+try:
+    gas_est = fn.estimate_gas({'from': addr})
+    # settlement on last submit can be much heavier; 30–50% headroom
+    gas_limit = int(int(gas_est) * 15 // 10)
+    # also clamp to something generous on local Hardhat
+    if gas_limit < 1_200_000:
+        gas_limit = 1_200_000
+except Exception as e:
+    print("   gas estimation failed, defaulting:", e)
+    gas_limit = 2_500_000
+
+submit = fn.build_transaction({
+    "from": addr,
+    "gas":  gas_limit,
+    "gasPrice": w3.eth.gas_price,
+    "nonce": w3.eth.get_transaction_count(addr, 'pending'),
+})
+send_tx(submit)
+print("   ✓ proof submitted")
+
+# 6) wait for auto-settlement (done on-chain in last submitProof) & withdraw
 while True:
-    closed, bestAcc, winnersCount, perWinnerWei = orch.functions.getResult(REQ_ID).call()
+    closed, bestAcc, winnersCount, perWinnerWei, perLoserWei = orch.functions.getResult(REQ_ID).call()
     if closed:
         winners = [orch.functions.winnerAt(REQ_ID, i).call() for i in range(winnersCount)]
-        print(f"[worker:{addr}] settled! bestAcc={bestAcc/100:.2f}% winners={winnersCount} perWinner={w3.from_wei(perWinnerWei,'ether')} ETH")
-        if addr in winners:
-            print(f"   🎉 You are a WINNER. Payout: {w3.from_wei(perWinnerWei,'ether')} ETH")
+        my_credit = orch.functions.getCredit(REQ_ID, addr).call()
+        print(f"[worker:{addr}] settled! bestAcc={bestAcc/100:.2f}% winners={winnersCount} "
+              f"perWinner={w3.from_wei(perWinnerWei,'ether')} ETH perLoser={w3.from_wei(perLoserWei,'ether')} ETH")
+        print("   winners:", winners)
+        if my_credit > 0:
+            print(f"   Your credit: {w3.from_wei(my_credit, 'ether')} ETH → withdrawing…")
+            wd = orch.functions.withdraw(REQ_ID).build_transaction({
+                "from": addr,
+                "gas": 120_000,
+                "gasPrice": w3.eth.gas_price,
+                "nonce": w3.eth.get_transaction_count(addr, 'pending'),
+            })
+            send_tx(wd)
+            print("   ✓ withdrawn")
         else:
-            print(f"   You did not win this round. Payout: {w3.from_wei(perWinnerWei,'ether')} ETH")
+            print("   No payout for this address.")
         break
-    print("   waiting for others to submit & settle…")
+    print("   waiting for settlement…")
     time.sleep(3)

@@ -5,49 +5,53 @@ import "./Groth16Verifier.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 contract AiOrchestrator is ReentrancyGuard {
-    /*────────────────── Data structures ──────────────────*/
+    /*────────────────── Types ──────────────────*/
     struct HyperParam { uint256 lr; uint256 steps; }
 
     struct Request {
         address   client;
         string    datasetCID;
-        uint256   bountyWei;         // total bounty supplied by client
-        HyperParam[] space;          // full HP grid
+        uint256   bountyWei;
+        HyperParam[] space;
 
         // lobby & lifecycle
-        address[] lobby;             // addresses in join order
-        bool      started;           // becomes true when lobby size == grid size
-        bool      closed;            // set on settlement
+        address[] lobby;    // join order
+        bool      started;  // set when lobby.size == grid.size
+        bool      closed;   // set when settlement computed
 
-        // results
-        address[] winners;           // winners after settlement (ties allowed)
-        uint256   bestAcc;           // best accuracy in basis points
-        uint256   perWinnerWei;      // payout per winner
+        // results (after settlement)
+        address[] winners;
+        uint256   bestAcc;        // basis points
+        uint256   perWinnerWei;   // credit per winner
+        uint256   perLoserWei;    // credit per loser (participants only)
     }
 
+    /*────────────────── Storage ──────────────────*/
     Groth16Verifier public immutable V;
 
-    // req ⇒ Request
     mapping(uint256 => Request) public R;
     uint256 public nextId;
 
-    // per-task book-keeping
-    // req ⇒ idx ⇒ node assigned to that hyper-param
-    mapping(uint256 => mapping(uint256 => address)) public taskOwner;
-    // req ⇒ idx ⇒ accuracy (0-10000) once proven
-    mapping(uint256 => mapping(uint256 => uint256)) public taskAcc;
-    // req ⇒ addr ⇒ joined
-    mapping(uint256 => mapping(address => bool)) public joined;
-    // NEW: req ⇒ addr ⇒ lobby position (0-based)
-    mapping(uint256 => mapping(address => uint256)) public joinIndex;
+    // book-keeping
+    mapping(uint256 => mapping(uint256 => address)) public taskOwner;   // req ⇒ idx ⇒ worker
+    mapping(uint256 => mapping(uint256 => uint256)) public taskAcc;     // req ⇒ idx ⇒ acc_bps
+    mapping(uint256 => mapping(address => bool))    public joined;      // req ⇒ addr
+    mapping(uint256 => mapping(address => uint256)) public joinIndex;   // req ⇒ addr ⇒ lobby pos
 
-    /*── Events ──*/
+    // pull-payments
+    mapping(uint256 => mapping(address => uint256)) public credit;      // req ⇒ addr ⇒ wei
+
+    // ─── Payout weights (winner gets WIN_W × loser) ───
+    uint256 private constant WIN_W = 3;
+    uint256 private constant LOS_W = 1;
+
+    /*────────────────── Events ──────────────────*/
     event RequestOpened(uint256 id, uint256 taskCount, uint256 bountyWei);
     event LobbyJoined(uint256 id, address node, uint256 joined, uint256 needed);
     event LobbyReady(uint256 id);
     event TaskClaimed(uint256 id, uint256 idx, address node);
     event ProofAccepted(uint256 id, uint256 idx, address node, uint256 acc);
-    event RequestClosed(uint256 id, uint256 bestAcc, uint256 winnersCount, uint256 perWinnerWei);
+    event RequestClosed(uint256 id, uint256 bestAcc, uint256 winnersCount, uint256 perWinnerWei, uint256 perLoserWei);
 
     constructor(address verifier) { V = Groth16Verifier(verifier); }
 
@@ -57,73 +61,57 @@ contract AiOrchestrator is ReentrancyGuard {
     {
         require(grid.length > 0, "grid empty");
         require(msg.value > 0, "bounty=0");
-
         id = nextId++;
         Request storage q = R[id];
         q.client     = msg.sender;
         q.datasetCID = cid;
         q.bountyWei  = msg.value;
         for (uint256 i; i < grid.length; ++i) q.space.push(grid[i]);
-
         emit RequestOpened(id, grid.length, msg.value);
     }
 
-    /*────────────────── Lobby API ──────────────────*/
+    /*────────────────── Lobby ──────────────────*/
     function joinLobby(uint256 id) external nonReentrant {
         Request storage q = R[id];
         require(!q.closed, "closed");
-        require(!q.started, "already started");
+        require(!q.started, "started");
         require(!joined[id][msg.sender], "already joined");
         require(q.lobby.length < q.space.length, "lobby full");
 
         joined[id][msg.sender] = true;
-
-        // record this account's 0-based position once, O(1)
         uint256 pos = q.lobby.length;
         joinIndex[id][msg.sender] = pos;
-
         q.lobby.push(msg.sender);
         emit LobbyJoined(id, msg.sender, q.lobby.length, q.space.length);
 
-        // when the lobby fills, just flip the flag (keep this cheap!)
         if (q.lobby.length == q.space.length) {
             q.started = true;
             emit LobbyReady(id);
         }
     }
 
-    function lobbyCounts(uint256 id)
-        external view
-        returns (uint256 needed, uint256 joinedCount, bool ready)
-    {
+    function lobbyCounts(uint256 id) external view returns (uint256 needed, uint256 joinedCount, bool ready) {
         Request storage q = R[id];
-        needed = q.space.length;
-        joinedCount = q.lobby.length;
-        ready = q.started;
+        return (q.space.length, q.lobby.length, q.started);
     }
 
     /*────────────────── Worker API ──────────────────*/
-    // Returns the unique index deterministically derived from lobby order.
+    // deterministic index derived from lobby order
     function claimTask(uint256 id) external returns (uint256 idx) {
         Request storage q = R[id];
         require(!q.closed, "closed");
-        require(q.started, "lobby not ready");
+        require(q.started, "not ready");
         require(joined[id][msg.sender], "not in lobby");
-
-        // O(1): derive your index from stored lobby position
         idx = joinIndex[id][msg.sender];
-
-        // one-time assignment (idempotent)
         if (taskOwner[id][idx] == address(0)) {
             taskOwner[id][idx] = msg.sender;
         } else {
             require(taskOwner[id][idx] == msg.sender, "index taken");
         }
-
         emit TaskClaimed(id, idx, msg.sender);
     }
 
-    // Prove the claimed task. When the last task is proven, automatically settle.
+    // On the last proof, settlement is computed automatically (no transfers here).
     function submitProof(
         uint256 id,
         uint256[2] calldata a,
@@ -136,32 +124,27 @@ contract AiOrchestrator is ReentrancyGuard {
         require(!q.closed, "closed");
         require(V.verifyProof(a,b,c,pubSignals), "bad proof");
 
-        // locate task index by (lr,steps)
+        // locate idx by (lr, steps)
         uint256 idx; bool found;
         for (uint256 i; i < q.space.length; ++i) {
-            if (pubSignals[0]==q.space[i].lr && pubSignals[1]==q.space[i].steps) {
-                idx=i; found=true; break;
-            }
+            if (pubSignals[0]==q.space[i].lr && pubSignals[1]==q.space[i].steps) { idx=i; found=true; break; }
         }
         require(found, "hp unknown");
         require(taskOwner[id][idx]==msg.sender, "task not yours");
-
-        // also ensure the claimed idx matches lobby position deterministically
         require(joinIndex[id][msg.sender] == idx, "wrong index");
-
         require(taskAcc[id][idx]==0, "already proven");
 
         taskAcc[id][idx] = pubSignals[2];
         emit ProofAccepted(id, idx, msg.sender, pubSignals[2]);
 
-        // if that was the last missing proof, auto-finalize and pay
+        // If this was the last missing proof, compute the settlement now.
         if (_allProven(id)) {
-            _finalizeAndPay(id);
+            _computeSettlement(id);
         }
     }
 
-    /*────────────────── Settlement (internal) ──────────────────*/
-    function _allProven(uint256 id) internal view returns (bool ok) {
+    /*────────────────── Internal: settlement (no external calls) ──────────────────*/
+    function _allProven(uint256 id) internal view returns (bool) {
         Request storage q = R[id];
         for (uint256 i; i < q.space.length; ++i) {
             if (taskAcc[id][i] == 0) return false;
@@ -169,44 +152,79 @@ contract AiOrchestrator is ReentrancyGuard {
         return true;
     }
 
-    function _finalizeAndPay(uint256 id) internal {
+    // Weight-based split: each winner has WIN_W weight, loser has LOS_W weight.
+    // Guarantees perWinner > perLoser for any w,l > 0.
+    function _computeSettlement(uint256 id) internal {
         Request storage q = R[id];
         require(!q.closed, "already closed");
 
-        // find best accuracy
-        uint256 bestAcc;
-        for (uint256 i; i < q.space.length; ++i) {
+        uint256 n = q.space.length;
+
+        // 1) best accuracy
+        uint256 best;
+        for (uint256 i; i < n; ++i) {
             uint256 a = taskAcc[id][i];
-            if (a > bestAcc) bestAcc = a;
+            if (a > best) best = a;
         }
-        q.bestAcc = bestAcc;
+        q.bestAcc = best;
 
-        // collect all winners (ties)
+        // 2) winners (ties allowed)
         delete q.winners;
-        for (uint256 i; i < q.space.length; ++i) {
-            if (taskAcc[id][i] == bestAcc) {
-                q.winners.push(taskOwner[id][i]);
-            }
+        for (uint256 i; i < n; ++i) {
+            if (taskAcc[id][i] == best) q.winners.push(taskOwner[id][i]);
         }
-        require(q.winners.length > 0, "no winners");
+        uint256 w = q.winners.length;
+        require(w > 0, "no winners");
+        uint256 l = n - w; // all proven ⇒ losers = rest
 
-        // split bounty evenly among winners (draws share equally)
-        uint256 per = q.bountyWei / q.winners.length;
-        q.perWinnerWei = per;
+        // 3) proportional split by weights
+        uint256 pot = q.bountyWei;
+        uint256 totalWeight = w * WIN_W + l * LOS_W; // >0 since w>0
+        uint256 unit = pot / totalWeight;
 
-        for (uint256 i; i < q.winners.length; ++i) {
-            payable(q.winners[i]).transfer(per);
+        uint256 perWinner = unit * WIN_W;
+        uint256 perLoser  = (l > 0) ? (unit * LOS_W) : 0;
+
+        q.perWinnerWei = perWinner;
+        q.perLoserWei  = perLoser;
+
+        // 4) assign credits
+        uint256 distributed = 0;
+        for (uint256 i; i < n; ++i) {
+            address worker = taskOwner[id][i];
+            if (worker == address(0)) continue;
+            bool isWinner = (taskAcc[id][i] == best);
+            uint256 amt = isWinner ? perWinner : perLoser;
+            credit[id][worker] += amt;
+            distributed += amt;
+        }
+
+        // 5) distribute remainder wei (if any) to winners to favor winners
+        uint256 remainder = pot - distributed;
+        uint256 winnersCount = q.winners.length;
+        for (uint256 i; i < winnersCount && remainder > 0; ++i) {
+            credit[id][q.winners[i]] += 1;
+            remainder -= 1;
         }
 
         q.closed = true;
-        emit RequestClosed(id, q.bestAcc, q.winners.length, per);
+        emit RequestClosed(id, q.bestAcc, w, perWinner, perLoser);
+    }
+
+    /*────────────────── Withdraw (pull payments) ──────────────────*/
+    function withdraw(uint256 id) external nonReentrant {
+        uint256 amt = credit[id][msg.sender];
+        require(amt > 0, "no credit");
+        credit[id][msg.sender] = 0;
+        (bool ok, ) = msg.sender.call{value: amt}("");
+        require(ok, "transfer failed");
     }
 
     /*────────────────── Views ──────────────────*/
     function getSpace(uint256 id) external view returns (HyperParam[] memory) { return R[id].space; }
 
     function taskOf(uint256 id, address node) external view returns (uint256 idx) {
-        for (uint256 i; i<R[id].space.length; ++i) if (taskOwner[id][i]==node) return i;
+        for (uint256 i; i < R[id].space.length; ++i) if (taskOwner[id][i]==node) return i;
         revert("none");
     }
 
@@ -214,13 +232,18 @@ contract AiOrchestrator is ReentrancyGuard {
         bool closed,
         uint256 bestAcc,
         uint256 winnersCount,
-        uint256 perWinnerWei
+        uint256 perWinnerWei,
+        uint256 perLoserWei
     ) {
         Request storage q = R[id];
-        return (q.closed, q.bestAcc, q.winners.length, q.perWinnerWei);
+        return (q.closed, q.bestAcc, q.winners.length, q.perWinnerWei, q.perLoserWei);
     }
 
     function winnerAt(uint256 id, uint256 i) external view returns (address) {
         return R[id].winners[i];
+    }
+
+    function getCredit(uint256 id, address who) external view returns (uint256) {
+        return credit[id][who];
     }
 }
