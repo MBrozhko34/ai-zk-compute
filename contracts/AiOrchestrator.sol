@@ -11,20 +11,32 @@ contract AiOrchestrator is ReentrancyGuard {
     struct Request {
         address   client;
         string    datasetCID;
-        uint256   bountyWei;
+        uint256   bountyWei;     // total bounty supplied by client [+ any slashed stakes]
         HyperParam[] space;
 
         // lobby & lifecycle
-        address[] lobby;    // join order
-        bool      started;  // set when lobby.size == grid.size
-        bool      closed;   // set when settlement computed
+        address[] lobby;         // join order (first N are "initial" workers)
+        bool      started;       // set when lobby.size == grid.size
+        bool      closed;        // set when settlement computed
 
         // results (after settlement)
         address[] winners;
-        uint256   bestAcc;        // basis points
-        uint256   perWinnerWei;   // credit per winner
-        uint256   perLoserWei;    // credit per loser (participants only)
+        uint256   bestAcc;       // basis points
+        uint256   perWinnerWei;  // credit per winner
+        uint256   perLoserWei;   // credit per loser (participants only)
     }
+
+    /*────────────────── Constants ──────────────────*/
+    // Fixed stake required to join for a given request.
+    uint256 public constant STAKE_WEI   = 0.01 ether;
+    // Penalty on dropouts (in basis points, e.g., 5000 = 50%).
+    uint256 public constant PENALTY_BPS = 5000; // 50%
+    // Grace window (seconds) after majority of proofs is reached before reclaims allowed.
+    uint256 public constant GRACE_SECS  = 10;
+
+    // Weight split for reward pools (guarantees perWinner > perLoser when w,l>0)
+    uint256 private constant WIN_W = 3;
+    uint256 private constant LOS_W = 1;
 
     /*────────────────── Storage ──────────────────*/
     Groth16Verifier public immutable V;
@@ -35,21 +47,26 @@ contract AiOrchestrator is ReentrancyGuard {
     // book-keeping
     mapping(uint256 => mapping(uint256 => address)) public taskOwner;   // req ⇒ idx ⇒ worker
     mapping(uint256 => mapping(uint256 => uint256)) public taskAcc;     // req ⇒ idx ⇒ acc_bps
-    mapping(uint256 => mapping(address => bool))    public joined;      // req ⇒ addr
-    mapping(uint256 => mapping(address => uint256)) public joinIndex;   // req ⇒ addr ⇒ lobby pos
+    mapping(uint256 => mapping(address => bool))    public joined;      // req ⇒ addr (staked & registered)
+    mapping(uint256 => mapping(address => uint256)) public joinIndex;   // req ⇒ addr ⇒ lobby pos (0..N-1 for initial)
+    mapping(uint256 => mapping(address => uint256)) public stakeOf;     // req ⇒ addr ⇒ stake held (wei)
 
-    // pull-payments
+    // settlement helpers
+    mapping(uint256 => uint256) public provenCount;    // req ⇒ # of proven tasks
+    mapping(uint256 => uint256) public graceStartAt;   // req ⇒ timestamp when majority was first reached
+
+    // pull-payments (rewards + stake refunds)
     mapping(uint256 => mapping(address => uint256)) public credit;      // req ⇒ addr ⇒ wei
-
-    // ─── Payout weights (winner gets WIN_W × loser) ───
-    uint256 private constant WIN_W = 3;
-    uint256 private constant LOS_W = 1;
 
     /*────────────────── Events ──────────────────*/
     event RequestOpened(uint256 id, uint256 taskCount, uint256 bountyWei);
-    event LobbyJoined(uint256 id, address node, uint256 joined, uint256 needed);
+    event LobbyJoined(uint256 id, address node, uint256 joined, uint256 needed, bool started);
     event LobbyReady(uint256 id);
     event TaskClaimed(uint256 id, uint256 idx, address node);
+    event TaskReassigned(uint256 id, uint256 idx, address oldWorker, address newWorker);
+    event StakeDeposited(uint256 id, address node, uint256 amount);
+    event StakeRefunded(uint256 id, address node, uint256 amount);
+    event StakeSlashed(uint256 id, address node, uint256 amount);
     event ProofAccepted(uint256 id, uint256 idx, address node, uint256 acc);
     event RequestClosed(uint256 id, uint256 bestAcc, uint256 winnersCount, uint256 perWinnerWei, uint256 perLoserWei);
 
@@ -70,24 +87,31 @@ contract AiOrchestrator is ReentrancyGuard {
         emit RequestOpened(id, grid.length, msg.value);
     }
 
-    /*────────────────── Lobby ──────────────────*/
-    function joinLobby(uint256 id) external nonReentrant {
+    /*────────────────── Lobby (stake + register) ──────────────────*/
+    // NOTE: joining is allowed even AFTER start, to permit replacements to register.
+    function joinLobby(uint256 id) external payable nonReentrant {
         Request storage q = R[id];
         require(!q.closed, "closed");
-        require(!q.started, "started");
-        require(!joined[id][msg.sender], "already joined");
-        require(q.lobby.length < q.space.length, "lobby full");
+        require(msg.value == STAKE_WEI, "bad stake");
 
-        joined[id][msg.sender] = true;
+        // deposit stake
+        require(stakeOf[id][msg.sender] == 0, "already staked");
+        stakeOf[id][msg.sender] = msg.value;
+        joined[id][msg.sender]  = true;
+        emit StakeDeposited(id, msg.sender, msg.value);
+
+        // append to lobby (even after start, for replacements)
         uint256 pos = q.lobby.length;
-        joinIndex[id][msg.sender] = pos;
         q.lobby.push(msg.sender);
-        emit LobbyJoined(id, msg.sender, q.lobby.length, q.space.length);
 
-        if (q.lobby.length == q.space.length) {
+        // If not started and we just reached N = grid size, mark started
+        uint256 needed = q.space.length;
+        if (!q.started && q.lobby.length == needed) {
             q.started = true;
             emit LobbyReady(id);
         }
+
+        emit LobbyJoined(id, msg.sender, q.lobby.length, needed, q.started);
     }
 
     function lobbyCounts(uint256 id) external view returns (uint256 needed, uint256 joinedCount, bool ready) {
@@ -96,19 +120,73 @@ contract AiOrchestrator is ReentrancyGuard {
     }
 
     /*────────────────── Worker API ──────────────────*/
-    // deterministic index derived from lobby order
+    // Deterministic index derived from the FIRST N (initial) lobby order:
+    // the first N addresses are mapped to indices [0..N-1] by their join order.
+    // Replacements (joined after start) MUST use reclaimTask().
     function claimTask(uint256 id) external returns (uint256 idx) {
         Request storage q = R[id];
         require(!q.closed, "closed");
         require(q.started, "not ready");
-        require(joined[id][msg.sender], "not in lobby");
-        idx = joinIndex[id][msg.sender];
+        require(joined[id][msg.sender], "not joined");
+
+        uint256 n = q.space.length;
+
+        // Determine if this address is one of the first N joiners.
+        // If yes, its index is its lobby position [0..N-1].
+        uint256 pos;
+        bool found;
+        for (uint256 i; i < q.lobby.length; ++i) {
+            if (q.lobby[i] == msg.sender) { pos = i; found = true; break; }
+        }
+        require(found, "not in lobby"); // should always be true due to joined[]
+        require(pos < n, "replacements must reclaim");
+
+        idx = pos;
+
+        // idempotent: set owner once, or check it matches
         if (taskOwner[id][idx] == address(0)) {
             taskOwner[id][idx] = msg.sender;
         } else {
             require(taskOwner[id][idx] == msg.sender, "index taken");
         }
         emit TaskClaimed(id, idx, msg.sender);
+    }
+
+    // Replacement: after grace, allow any joined/staked account to take over an unproven task.
+    function reclaimTask(uint256 id, uint256 idx) external nonReentrant {
+        Request storage q = R[id];
+        require(q.started, "not started");
+        require(!q.closed, "closed");
+        require(joined[id][msg.sender], "not joined");
+        require(stakeOf[id][msg.sender] >= STAKE_WEI, "no stake");
+        require(idx < q.space.length, "bad idx");
+        require(taskAcc[id][idx] == 0, "already proven");
+
+        // Must wait until majority has submitted + grace has elapsed
+        uint256 n = q.space.length;
+        uint256 needMaj = (n + 1) / 2; // ceil(n/2)
+        require(provenCount[id] >= needMaj, "no majority yet");
+        uint256 startTs = graceStartAt[id];
+        require(startTs != 0 && block.timestamp >= startTs + GRACE_SECS, "grace");
+
+        address old = taskOwner[id][idx];
+        if (old != address(0) && old != msg.sender) {
+            // slash previous assignee (if they had stake)
+            uint256 st = stakeOf[id][old];
+            if (st > 0) {
+                uint256 pen = (st * PENALTY_BPS) / 10_000;
+                uint256 back = st - pen;
+                stakeOf[id][old] = 0;
+                // add penalty into bounty pot so winners benefit
+                q.bountyWei += pen;
+                // let the dropped worker withdraw remaining stake (pull model)
+                credit[id][old] += back;
+                emit StakeSlashed(id, old, pen);
+            }
+        }
+
+        taskOwner[id][idx] = msg.sender;
+        emit TaskReassigned(id, idx, old, msg.sender);
     }
 
     // On the last proof, settlement is computed automatically (no transfers here).
@@ -131,11 +209,25 @@ contract AiOrchestrator is ReentrancyGuard {
         }
         require(found, "hp unknown");
         require(taskOwner[id][idx]==msg.sender, "task not yours");
-        require(joinIndex[id][msg.sender] == idx, "wrong index");
         require(taskAcc[id][idx]==0, "already proven");
 
         taskAcc[id][idx] = pubSignals[2];
         emit ProofAccepted(id, idx, msg.sender, pubSignals[2]);
+
+        // stake refund (pull) on successful proof
+        uint256 st = stakeOf[id][msg.sender];
+        if (st > 0) {
+            stakeOf[id][msg.sender] = 0;
+            credit[id][msg.sender] += st;
+            emit StakeRefunded(id, msg.sender, st);
+        }
+
+        // majority tracking & grace start
+        uint256 pc = ++provenCount[id];
+        uint256 n = q.space.length;
+        if (pc >= (n + 1)/2 && graceStartAt[id] == 0) {
+            graceStartAt[id] = block.timestamp;
+        }
 
         // If this was the last missing proof, compute the settlement now.
         if (_allProven(id)) {
@@ -152,8 +244,7 @@ contract AiOrchestrator is ReentrancyGuard {
         return true;
     }
 
-    // Weight-based split: each winner has WIN_W weight, loser has LOS_W weight.
-    // Guarantees perWinner > perLoser for any w,l > 0.
+    // Weight-based split: winners get WIN_W per head; losers get LOS_W per head.
     function _computeSettlement(uint256 id) internal {
         Request storage q = R[id];
         require(!q.closed, "already closed");
@@ -188,7 +279,7 @@ contract AiOrchestrator is ReentrancyGuard {
         q.perWinnerWei = perWinner;
         q.perLoserWei  = perLoser;
 
-        // 4) assign credits
+        // 4) assign credits (rewards only; stake refunds already credited on success)
         uint256 distributed = 0;
         for (uint256 i; i < n; ++i) {
             address worker = taskOwner[id][i];
@@ -199,7 +290,7 @@ contract AiOrchestrator is ReentrancyGuard {
             distributed += amt;
         }
 
-        // 5) distribute remainder wei (if any) to winners to favor winners
+        // 5) distribute leftover wei (if any) to winners to favor winners
         uint256 remainder = pot - distributed;
         uint256 winnersCount = q.winners.length;
         for (uint256 i; i < winnersCount && remainder > 0; ++i) {

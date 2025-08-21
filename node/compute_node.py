@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Join lobby, wait for start, claim task, train XOR, prove (Groth16),
-auto-settlement on last proof, then withdraw payout — with robust error handling (fixed send_tx API)."""
+"""Join lobby (with stake), wait for start, claim or reclaim a task,
+train XOR, prove (Groth16), auto-settlement on last proof, then withdraw payout —
+with robust error handling + replacement mode for dropped workers."""
 import json, os, subprocess, tempfile, pathlib, time, hashlib
 from typing import Optional
 
@@ -106,16 +107,17 @@ def explain_web3_error(e: Exception) -> str:
 def next_nonce() -> int:
     return w3.eth.get_transaction_count(acct.address, "pending")
 
-def send_tx(fn_call, *, min_gas: int = 200_000, headroom_num: int = 15, headroom_den: int = 10):
+def send_tx(fn_call, *, value: int = 0, min_gas: int = 200_000, headroom_num: int = 15, headroom_den: int = 10):
     """
     Send a ContractFunction:
       - estimate gas (with headroom), fall back to generous default if needed
       - sign, send, wait
+      - supports payable (value)
       - basic retries for nonce/gossip races
     """
     # estimate gas with headroom
     try:
-        est = int(fn_call.estimate_gas({"from": acct.address}))
+        est = int(fn_call.estimate_gas({"from": acct.address, "value": value}))
         gas_limit = max(min_gas, est * headroom_num // headroom_den)
     except Exception as e:
         print("   gas estimation failed, defaulting:", explain_web3_error(e))
@@ -129,6 +131,7 @@ def send_tx(fn_call, *, min_gas: int = 200_000, headroom_num: int = 15, headroom
                 "gas":  gas_limit,
                 "gasPrice": w3.eth.gas_price,
                 "nonce": next_nonce(),
+                "value": value,
             })
             signed = acct.sign_transaction(tx)
             h = w3.eth.send_raw_transaction(signed.rawTransaction)
@@ -145,6 +148,17 @@ def send_tx(fn_call, *, min_gas: int = 200_000, headroom_num: int = 15, headroom
             raise RuntimeError(msg) from e
 
 
+# ───────── small helpers
+def space_len() -> int:
+    return len(orch.functions.getSpace(REQ_ID).call())
+
+def first_unproven_index(n: int) -> Optional[int]:
+    for i in range(n):
+        if orch.functions.taskAcc(REQ_ID, i).call() == 0:
+            return i
+    return None
+
+
 # ───────── workflow
 addr = acct.address
 print(f"[worker:{addr}] joining lobby for request {REQ_ID}…")
@@ -158,59 +172,132 @@ try:
 except Exception as e:
     print("   warning: getResult() failed (continuing):", explain_web3_error(e))
 
-# 0) join the lobby
+# Fetch stake + grace constants
 try:
-    if orch.functions.joined(REQ_ID, addr).call():
-        print("   already joined lobby.")
+    required_stake = int(orch.functions.STAKE_WEI().call())
+    grace_secs     = int(orch.functions.GRACE_SECS().call())
+except Exception:
+    # Fallback defaults if getters unavailable (should not happen)
+    required_stake = int(Web3.to_wei(0.01, "ether"))
+    grace_secs     = 10
+
+# 0) join the lobby (payable with stake) — allowed both before/after start
+try:
+    already_joined = False
+    try:
+        already_joined = bool(orch.functions.joined(REQ_ID, addr).call())
+    except Exception:
+        pass
+
+    my_stake = 0
+    try:
+        my_stake = int(orch.functions.stakeOf(REQ_ID, addr).call())
+    except Exception:
+        pass
+
+    if already_joined or my_stake >= required_stake:
+        print("   already staked & joined lobby.")
     else:
-        send_tx(orch.functions.joinLobby(REQ_ID), min_gas=200_000)
-        print("   ✓ joined lobby")
+        send_tx(orch.functions.joinLobby(REQ_ID), value=required_stake, min_gas=250_000)
+        print(f"   ✓ joined lobby with stake {w3.from_wei(required_stake, 'ether')} ETH")
 except RuntimeError as e:
     msg = str(e)
-    if "already joined" in msg:
-        print("   already joined lobby.")
-    elif "started" in msg:
-        print("   lobby already started; cannot join. Exiting.")
-        raise SystemExit(0)
-    elif "lobby full" in msg:
-        print("   lobby is full; cannot join. Exiting.")
-        raise SystemExit(0)
-    elif "closed" in msg:
-        print("   request is closed; cannot join. Exiting.")
-        raise SystemExit(0)
-    else:
-        print("   joinLobby failed:", msg); raise SystemExit(1)
+    if "bad stake" in msg:
+        eth = w3.from_wei(required_stake, "ether")
+        print(f"   must send stake of exactly {eth} ETH; exiting."); raise SystemExit(1)
+    if "closed" in msg:
+        print("   request is closed; cannot join. Exiting."); raise SystemExit(0)
+    print("   joinLobby failed:", msg); raise SystemExit(1)
 
-# 0b) wait until ready
+# 0b) wait until ready (first N joiners = initial cohort)
 while True:
     try:
         needed, joined, ready = orch.functions.lobbyCounts(REQ_ID).call()
         print(f"   lobby: {joined}/{needed} ready={ready}")
         if ready: break
-        time.sleep(3)
+        time.sleep(2)
     except Exception as e:
         print("   lobbyCounts() failed (retrying):", explain_web3_error(e))
         time.sleep(2)
 
-# 1) claim assigned task
+N = space_len()
+
+# 1) Try to claim assigned task (only valid for first N joiners). Otherwise, go replacement mode.
+replacement_mode = False
 try:
-    send_tx(orch.functions.claimTask(REQ_ID), min_gas=200_000)
-    print("   ✓ claimed task")
+    send_tx(orch.functions.claimTask(REQ_ID), min_gas=220_000)
+    print("   ✓ claimed task (initial cohort)")
+    idx = orch.functions.taskOf(REQ_ID, addr).call()
 except RuntimeError as e:
     msg = str(e)
-    if "not ready" in msg:
-        print("   lobby not ready; should not happen now. Exiting."); raise SystemExit(1)
-    if "not in lobby" in msg:
-        print("   not in lobby; cannot claim. Exiting."); raise SystemExit(1)
-    if "index taken" in msg:
-        print("   task index already claimed; exiting."); raise SystemExit(0)
-    if "closed" in msg:
+    if "replacements must reclaim" in msg or "index taken" in msg or "not in lobby" in msg:
+        print("   cannot claim as initial worker → switching to replacement mode.")
+        replacement_mode = True
+    elif "closed" in msg:
         print("   request closed before claim; exiting."); raise SystemExit(0)
-    print("   claimTask failed:", msg); raise SystemExit(1)
+    else:
+        print("   claimTask failed:", msg); raise SystemExit(1)
 
-# resolve own task/hp
+if replacement_mode:
+    # Wait for majority + grace window, then reclaim any unproven index.
+    need_maj = (N + 1) // 2
+    while True:
+        try:
+            pc = int(orch.functions.provenCount(REQ_ID).call())
+            if pc >= need_maj:
+                break
+            print(f"   waiting for majority… {pc}/{need_maj}")
+            time.sleep(2)
+        except Exception as e:
+            print("   provenCount() failed (retrying):", explain_web3_error(e))
+            time.sleep(2)
+
+    # Wait for grace window to elapse
+    while True:
+        try:
+            start_ts = int(orch.functions.graceStartAt(REQ_ID).call())
+            if start_ts != 0:
+                # compare to chain time
+                now = int(w3.eth.get_block("latest")["timestamp"])
+                remain = start_ts + grace_secs - now
+                if remain <= 0:
+                    break
+                print(f"   grace window active… {remain}s remaining")
+            else:
+                print("   grace not set yet; retrying…")
+            time.sleep(2)
+        except Exception as e:
+            print("   graceStartAt() failed (retrying):", explain_web3_error(e))
+            time.sleep(2)
+
+    # Find an unproven task and reclaim it
+    target = first_unproven_index(N)
+    if target is None:
+        print("   no unproven tasks to reclaim; likely settling soon."); pass
+    else:
+        try:
+            send_tx(orch.functions.reclaimTask(REQ_ID, target), min_gas=260_000)
+            print(f"   ✓ reclaimed task idx={target}")
+        except RuntimeError as e:
+            msg = str(e)
+            if "grace" in msg or "no majority yet" in msg:
+                print("   reclaim too early; exiting."); raise SystemExit(0)
+            if "already proven" in msg:
+                print("   race: target just got proven; continuing to watch settlement.")
+            elif "closed" in msg:
+                print("   request closed; exiting."); raise SystemExit(0)
+            else:
+                print("   reclaimTask failed:", msg); raise SystemExit(1)
+
+        # confirm our assigned index after reclaim
+        try:
+            idx = orch.functions.taskOf(REQ_ID, addr).call()
+            print(f"   assigned idx after reclaim = {idx}")
+        except Exception as e:
+            print("   taskOf() failed after reclaim:", explain_web3_error(e)); raise SystemExit(1)
+
+# resolve HP
 try:
-    idx = orch.functions.taskOf(REQ_ID, addr).call()
     lr_ppm, steps = orch.functions.getSpace(REQ_ID).call()[idx]
     print(f"[worker:{addr}] idx={idx}, lr_ppm={lr_ppm}, steps={steps}")
 except Exception as e:
@@ -303,18 +390,63 @@ except RuntimeError as e:
     else:
         print("   submitProof failed:", msg); raise SystemExit(1)
 
-# 6) wait for auto-settlement & withdraw
+# 6) wait for auto-settlement & withdraw (with clear stake/reward breakdown)
 while True:
     try:
         closed, bestAcc, winnersCount, perWinnerWei, perLoserWei = orch.functions.getResult(REQ_ID).call()
         if closed:
             winners = [orch.functions.winnerAt(REQ_ID, i).call() for i in range(winnersCount)]
             my_credit = orch.functions.getCredit(REQ_ID, addr).call()
+
+            # Figure out if we are a winner by comparing our proven accuracy to bestAcc
+            try:
+                my_idx = orch.functions.taskOf(REQ_ID, addr).call()
+                my_acc = orch.functions.taskAcc(REQ_ID, my_idx).call()
+                am_winner = (int(my_acc) == int(bestAcc))
+            except Exception:
+                # Fallback: if we’re in winners list, treat as winner
+                am_winner = addr in winners
+
+            role = "WINNER" if am_winner else "LOSER"
+            expected_reward = perWinnerWei if am_winner else perLoserWei
+
+            # Try to learn stake amount:
+            stake_wei = None
+            # Preferred: public constant STAKE_WEI()
+            try:
+                stake_wei = int(orch.functions.STAKE_WEI().call())
+            except Exception:
+                # Fallback: public mapping stakeOf(id, addr)
+                try:
+                    stake_wei = int(orch.functions.stakeOf(REQ_ID, addr).call())
+                except Exception:
+                    stake_wei = None
+
+            # Compute breakdown
+            # If stake is known: assume full refund on success (you submitted a valid proof)
+            if stake_wei is not None:
+                # reward is "what's left" after the stake refund
+                # Note: winners may receive a few extra wei from remainder distribution
+                stake_refund = min(stake_wei, my_credit)
+                reward_amt   = my_credit - stake_refund
+                reward_note  = "" if reward_amt == expected_reward else " (incl. remainder)"
+            else:
+                # Stake unknown → approximate using expected reward
+                # Clamp to avoid negatives if rounding/remainder made total slightly smaller.
+                reward_amt   = min(expected_reward, my_credit)
+                stake_refund = my_credit - reward_amt
+                reward_note  = " (approx.)" if reward_amt != expected_reward else ""
+
             print(f"[worker:{addr}] settled! bestAcc={bestAcc/100:.2f}% winners={winnersCount} "
                   f"perWinner={w3.from_wei(perWinnerWei,'ether')} ETH perLoser={w3.from_wei(perLoserWei,'ether')} ETH")
             print("   winners:", winners)
+            print(f"   role: {role}")
+            print(f"   stake refund: {w3.from_wei(int(stake_refund), 'ether')} ETH")
+            print(f"   reward:       {w3.from_wei(int(reward_amt),   'ether')} ETH{reward_note}")
+            print(f"   total credit: {w3.from_wei(int(my_credit),    'ether')} ETH")
+
             if my_credit > 0:
-                print(f"   Your credit: {w3.from_wei(my_credit, 'ether')} ETH → withdrawing…")
+                print("   Withdrawing…")
                 try:
                     send_tx(orch.functions.withdraw(REQ_ID), min_gas=120_000)
                     print("   ✓ withdrawn")
@@ -332,5 +464,6 @@ while True:
         print("   waiting for settlement…")
         time.sleep(3)
     except Exception as e:
-        print("   getResult/winnerAt/getCredit failed (retrying):", explain_web3_error(e))
+        print("   getResult/winnerAt/getCredit failed (retrying):", e)
         time.sleep(3)
+
