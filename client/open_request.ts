@@ -30,11 +30,8 @@ if (!process.env.ORCH_ADDR || !process.env.ORCH_ADDR.startsWith("0x")) {
   const perTask = ethers.parseEther("0.01");
   const bounty  = perTask * BigInt(grid.length);
 
-  const tx = await orch.openRequest(
-    "ipfs://Qm...datasetCID",
-    grid,
-    { value: bounty }
-  );
+  const tx = await orch.openRequest("ipfs://...datasetCID", grid, /* minWorkers */ 2, { value: bounty });
+
   const rc = await tx.wait();
   const log = rc!.logs[0] as any;
   console.log("request id", log.args!.id.toString());

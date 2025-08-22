@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
-"""Join lobby (with stake), wait for start, claim or reclaim a task,
-train XOR, prove (Groth16), auto-settlement on last proof, then withdraw payout —
-with robust error handling + replacement mode for dropped workers."""
+"""Join lobby, wait for start (minWorkers), claim tasks with bond, train XOR, prove (Groth16),
+auto-settlement on last proof, reclaim timed-out tasks using chain time, then withdraw payout."""
 import json, os, subprocess, tempfile, pathlib, time, hashlib
-from typing import Optional
+from typing import Optional, List
 
 from web3 import Web3, HTTPProvider
 from eth_account import Account
 from eth_account.signers.local import LocalAccount
 import torch, torch.nn as nn
-
 
 # ───────── env
 RPC_URL   = os.getenv("RPC_URL", "http://127.0.0.1:8545")
@@ -23,14 +21,11 @@ CIRC_DIR  = pathlib.Path("../circuits/XorCircuit_js")
 ABI_PATH  = pathlib.Path("../artifacts/contracts/AiOrchestrator.sol/AiOrchestrator.json")
 assert ORCH_ADDR and PRIV, "ORCH_ADDR & PRIVATE_KEY required"
 
-
 # ───────── helpers (mirror circuit)
 def bin01_list(tensor_flat):
-    # IMPORTANT: no rounding and strict > 0.0 threshold
     return [1 if float(v) > 0.0 else 0 for v in tensor_flat]
 
-clamp3 = lambda x: min(max(int(x), 0), 3)    # 0..3 for Step()
-
+clamp3 = lambda x: min(max(int(x), 0), 3)
 def xor_forward(x0, x1, wIH, bH, bO):
     h0 = clamp3(wIH[0]*x0 + wIH[1]*x1 + bH[0])
     h1 = clamp3(wIH[2]*x0 + wIH[3]*x1 + bH[1])
@@ -39,37 +34,28 @@ def xor_forward(x0, x1, wIH, bH, bO):
     o  = clamp3(s0 - s1 + bO)
     return 1 if o >= 1 else 0
 
-
 # ───────── chain handles
 w3: Web3 = Web3(HTTPProvider(RPC_URL))
 acct: LocalAccount = Account.from_key(PRIV)
 orch = w3.eth.contract(address=w3.to_checksum_address(ORCH_ADDR),
                        abi=json.load(open(ABI_PATH))["abi"])
 
-
-# ───────── error decoding utilities
-ERROR_STRING_SELECTOR = bytes.fromhex("08c379a0")  # Error(string)
-PANIC_SELECTOR        = bytes.fromhex("4e487b71")  # Panic(uint256)
-REENTRANCY_SELECTOR   = bytes.fromhex("3ee5aeb5")  # ReentrancyGuardReentrantCall()
-
+# ───────── err decode
 def _decode_error_string(data_hex: str) -> Optional[str]:
     try:
         if not data_hex or not data_hex.startswith("0x"):
             return None
         b = bytes.fromhex(data_hex[2:])
-        if len(b) < 4:
-            return None
-        selector = b[:4]
-        if selector == ERROR_STRING_SELECTOR:
+        if len(b) < 4: return None
+        sel = b[:4]
+        if sel == bytes.fromhex("08c379a0"):
             if len(b) >= 4 + 32 + 32:
                 strlen = int.from_bytes(b[4+32:4+32+32], "big")
-                start  = 4 + 32 + 32
-                end    = start + strlen
-                if end <= len(b):
-                    return b[start:end].decode("utf-8", errors="replace")
-        elif selector == PANIC_SELECTOR:
+                s = b[4+32+32:4+32+32+strlen]
+                return s.decode("utf-8", errors="replace")
+        elif sel == bytes.fromhex("4e487b71"):
             return "panic()"
-        elif selector == REENTRANCY_SELECTOR:
+        elif sel == bytes.fromhex("3ee5aeb5"):
             return "ReentrancyGuardReentrantCall()"
         return None
     except Exception:
@@ -77,22 +63,7 @@ def _decode_error_string(data_hex: str) -> Optional[str]:
 
 def explain_web3_error(e: Exception) -> str:
     if isinstance(e, ValueError) and e.args and isinstance(e.args[0], dict):
-        err = e.args[0]
-        msg = err.get("message", "")
-        data = err.get("data")
-        for needle in [
-            "reverted with reason string",
-            "execution reverted",
-            "Transaction ran out of gas",
-            "nonce too low",
-            "replacement transaction underpriced",
-            "already known",
-        ]:
-            if needle in msg:
-                if "reverted with reason string" in msg:
-                    tail = msg.split("reverted with reason string")[-1].strip()
-                    return f"revert {tail.strip(': ').strip()}"
-                return msg
+        err = e.args[0]; msg = err.get("message",""); data = err.get("data")
         if isinstance(data, dict):
             s = _decode_error_string(data.get("data") or "")
             if s: return f"revert '{s}'"
@@ -102,20 +73,11 @@ def explain_web3_error(e: Exception) -> str:
         return msg or str(e)
     return str(e)
 
-
-# ───────── tx helpers (ContractFunction only)
+# ───────── tx helpers
 def next_nonce() -> int:
     return w3.eth.get_transaction_count(acct.address, "pending")
 
 def send_tx(fn_call, *, value: int = 0, min_gas: int = 200_000, headroom_num: int = 15, headroom_den: int = 10):
-    """
-    Send a ContractFunction:
-      - estimate gas (with headroom), fall back to generous default if needed
-      - sign, send, wait
-      - supports payable (value)
-      - basic retries for nonce/gossip races
-    """
-    # estimate gas with headroom
     try:
         est = int(fn_call.estimate_gas({"from": acct.address, "value": value}))
         gas_limit = max(min_gas, est * headroom_num // headroom_den)
@@ -144,26 +106,28 @@ def send_tx(fn_call, *, value: int = 0, min_gas: int = 200_000, headroom_num: in
                     time.sleep(0.5)
                     continue
             if "ran out of gas" in msg.lower() or "intrinsic gas too low" in msg.lower():
-                raise RuntimeError(f"transaction OOG — try higher gas. Details: {msg}") from e
+                raise RuntimeError(f"OOG — try higher gas. Details: {msg}") from e
             raise RuntimeError(msg) from e
 
-
 # ───────── small helpers
+def chain_now() -> int:
+    return int(w3.eth.get_block("latest")["timestamp"])
+
 def space_len() -> int:
     return len(orch.functions.getSpace(REQ_ID).call())
 
-def first_unproven_index(n: int) -> Optional[int]:
+def count_proven(n: int) -> int:
+    c = 0
     for i in range(n):
-        if orch.functions.taskAcc(REQ_ID, i).call() == 0:
-            return i
-    return None
-
+        if orch.functions.taskAcc(REQ_ID, i).call() != 0:
+            c += 1
+    return c
 
 # ───────── workflow
 addr = acct.address
-print(f"[worker:{addr}] joining lobby for request {REQ_ID}…")
+print(f"[worker:{addr}] starting on request {REQ_ID}…")
 
-# Early exit if closed
+# Early exit if already closed
 try:
     closed, *_ = orch.functions.getResult(REQ_ID).call()
     if closed:
@@ -172,175 +136,67 @@ try:
 except Exception as e:
     print("   warning: getResult() failed (continuing):", explain_web3_error(e))
 
-# Fetch stake + grace constants
+# bond / ttl
 try:
-    required_stake = int(orch.functions.STAKE_WEI().call())
-    grace_secs     = int(orch.functions.GRACE_SECS().call())
+    bond_wei = int(orch.functions.CLAIM_BOND_WEI().call())
+    ttl_sec  = int(orch.functions.CLAIM_TTL().call())
 except Exception:
-    # Fallback defaults if getters unavailable (should not happen)
-    required_stake = int(Web3.to_wei(0.01, "ether"))
-    grace_secs     = 10
+    bond_wei = int(Web3.to_wei(0.005, "ether")); ttl_sec = 10
 
-# 0) join the lobby (payable with stake) — allowed both before/after start
+# 0) join
 try:
-    already_joined = False
-    try:
-        already_joined = bool(orch.functions.joined(REQ_ID, addr).call())
-    except Exception:
-        pass
-
-    my_stake = 0
-    try:
-        my_stake = int(orch.functions.stakeOf(REQ_ID, addr).call())
-    except Exception:
-        pass
-
-    if already_joined or my_stake >= required_stake:
-        print("   already staked & joined lobby.")
+    if orch.functions.joined(REQ_ID, addr).call():
+        print("   already joined lobby.")
     else:
-        send_tx(orch.functions.joinLobby(REQ_ID), value=required_stake, min_gas=250_000)
-        print(f"   ✓ joined lobby with stake {w3.from_wei(required_stake, 'ether')} ETH")
-except RuntimeError as e:
-    msg = str(e)
-    if "bad stake" in msg:
-        eth = w3.from_wei(required_stake, "ether")
-        print(f"   must send stake of exactly {eth} ETH; exiting."); raise SystemExit(1)
-    if "closed" in msg:
-        print("   request is closed; cannot join. Exiting."); raise SystemExit(0)
-    print("   joinLobby failed:", msg); raise SystemExit(1)
+        # preflight join
+        orch.functions.joinLobby(REQ_ID).call({"from": addr})
+        send_tx(orch.functions.joinLobby(REQ_ID))
+        print("   ✓ joined lobby")
+except Exception as e:
+    msg = explain_web3_error(e)
+    if "already joined" in msg: print("   already joined lobby.")
+    elif "closed" in msg:      print("   request closed; exiting."); raise SystemExit(0)
+    else:                      print("   joinLobby failed:", msg);  raise SystemExit(1)
 
-# 0b) wait until ready (first N joiners = initial cohort)
+# 0b) wait for start
 while True:
     try:
         needed, joined, ready = orch.functions.lobbyCounts(REQ_ID).call()
         print(f"   lobby: {joined}/{needed} ready={ready}")
         if ready: break
-        time.sleep(2)
+        time.sleep(1.5)
     except Exception as e:
-        print("   lobbyCounts() failed (retrying):", explain_web3_error(e))
-        time.sleep(2)
+        print("   lobbyCounts() failed:", explain_web3_error(e)); time.sleep(1.5)
 
-N = space_len()
+# Train/prove/submit helper
+def do_task(idx: int, lr_ppm: int, steps: int):
+    seed = int.from_bytes(hashlib.sha256(f"{lr_ppm}:{steps}".encode()).digest()[:8], "big")
+    torch.manual_seed(seed)
 
-# 1) Try to claim assigned task (only valid for first N joiners). Otherwise, go replacement mode.
-replacement_mode = False
-try:
-    send_tx(orch.functions.claimTask(REQ_ID), min_gas=220_000)
-    print("   ✓ claimed task (initial cohort)")
-    idx = orch.functions.taskOf(REQ_ID, addr).call()
-except RuntimeError as e:
-    msg = str(e)
-    if "replacements must reclaim" in msg or "index taken" in msg or "not in lobby" in msg:
-        print("   cannot claim as initial worker → switching to replacement mode.")
-        replacement_mode = True
-    elif "closed" in msg:
-        print("   request closed before claim; exiting."); raise SystemExit(0)
-    else:
-        print("   claimTask failed:", msg); raise SystemExit(1)
+    X = torch.tensor([[0,0],[1,0],[0,1],[1,1]], dtype=torch.float32)
+    y = torch.tensor([[0],[1],[1],[0]], dtype=torch.float32)
 
-if replacement_mode:
-    # Wait for majority + grace window, then reclaim any unproven index.
-    need_maj = (N + 1) // 2
-    while True:
-        try:
-            pc = int(orch.functions.provenCount(REQ_ID).call())
-            if pc >= need_maj:
-                break
-            print(f"   waiting for majority… {pc}/{need_maj}")
-            time.sleep(2)
-        except Exception as e:
-            print("   provenCount() failed (retrying):", explain_web3_error(e))
-            time.sleep(2)
+    net = nn.Sequential(nn.Linear(2,2), nn.Sigmoid(),
+                        nn.Linear(2,1), nn.Sigmoid())
+    opt = torch.optim.SGD(net.parameters(), lr_ppm/1_000_000)
+    crit = nn.BCELoss()
+    for _ in range(int(steps)):
+        opt.zero_grad(); crit(net(X),y).backward(); opt.step()
 
-    # Wait for grace window to elapse
-    while True:
-        try:
-            start_ts = int(orch.functions.graceStartAt(REQ_ID).call())
-            if start_ts != 0:
-                # compare to chain time
-                now = int(w3.eth.get_block("latest")["timestamp"])
-                remain = start_ts + grace_secs - now
-                if remain <= 0:
-                    break
-                print(f"   grace window active… {remain}s remaining")
-            else:
-                print("   grace not set yet; retrying…")
-            time.sleep(2)
-        except Exception as e:
-            print("   graceStartAt() failed (retrying):", explain_web3_error(e))
-            time.sleep(2)
+    wIH = bin01_list(net[0].weight.detach().flatten().tolist())
+    bH  = bin01_list(net[0].bias.detach().flatten().tolist())
+    bO  = 1
+    preds   = [xor_forward(*xy, wIH, bH, bO) for xy in [(0,0),(1,0),(0,1),(1,1)]]
+    correct = sum(int(p==t) for p,t in zip(preds, [0,1,1,0]))
+    acc_bps = correct * 2500
+    print(f"   [task {idx}] acc = {correct}/4 → {acc_bps/100}%")
 
-    # Find an unproven task and reclaim it
-    target = first_unproven_index(N)
-    if target is None:
-        print("   no unproven tasks to reclaim; likely settling soon."); pass
-    else:
-        try:
-            send_tx(orch.functions.reclaimTask(REQ_ID, target), min_gas=260_000)
-            print(f"   ✓ reclaimed task idx={target}")
-        except RuntimeError as e:
-            msg = str(e)
-            if "grace" in msg or "no majority yet" in msg:
-                print("   reclaim too early; exiting."); raise SystemExit(0)
-            if "already proven" in msg:
-                print("   race: target just got proven; continuing to watch settlement.")
-            elif "closed" in msg:
-                print("   request closed; exiting."); raise SystemExit(0)
-            else:
-                print("   reclaimTask failed:", msg); raise SystemExit(1)
-
-        # confirm our assigned index after reclaim
-        try:
-            idx = orch.functions.taskOf(REQ_ID, addr).call()
-            print(f"   assigned idx after reclaim = {idx}")
-        except Exception as e:
-            print("   taskOf() failed after reclaim:", explain_web3_error(e)); raise SystemExit(1)
-
-# resolve HP
-try:
-    lr_ppm, steps = orch.functions.getSpace(REQ_ID).call()[idx]
-    print(f"[worker:{addr}] idx={idx}, lr_ppm={lr_ppm}, steps={steps}")
-except Exception as e:
-    print("   could not fetch assigned HP:", explain_web3_error(e))
-    raise SystemExit(1)
-
-# deterministic seed per HP
-seed_src = f"{lr_ppm}:{steps}".encode()
-seed = int.from_bytes(hashlib.sha256(seed_src).digest()[:8], "big")
-torch.manual_seed(seed)
-
-# 2) train small MLP on XOR
-X = torch.tensor([[0,0],[1,0],[0,1],[1,1]], dtype=torch.float32)
-y = torch.tensor([[0],[1],[1],[0]], dtype=torch.float32)
-
-net = nn.Sequential(nn.Linear(2,2), nn.Sigmoid(),
-                    nn.Linear(2,1), nn.Sigmoid())
-opt = torch.optim.SGD(net.parameters(), lr_ppm/1_000_000)
-crit = nn.BCELoss()
-for _ in range(int(steps)):
-    opt.zero_grad(); crit(net(X),y).backward(); opt.step()
-
-# 3) binarise & circuit-compatible accuracy
-w_flat = net[0].weight.detach().flatten().tolist()
-b_flat = net[0].bias.detach().flatten().tolist()
-wIH = bin01_list(w_flat)          # 4 ints in {0,1}
-bH  = bin01_list(b_flat)          # 2 ints in {0,1}
-bO  = 1                           # avoid negatives
-
-preds   = [xor_forward(*xy, wIH, bH, bO) for xy in [(0,0),(1,0),(0,1),(1,1)]]
-correct = sum(int(p==t) for p,t in zip(preds, [0,1,1,0]))
-acc_bps = correct * 2500
-print(f"   circuit-compatible acc = {correct}/4 → {acc_bps/100}%")
-
-# 4) witness & proof
-with tempfile.TemporaryDirectory() as td:
-    tmp = pathlib.Path(td)
-    (tmp/"input.json").write_text(json.dumps({
-        "lr": lr_ppm, "steps": steps, "acc_bps": acc_bps,
-        "wIH": wIH, "bH":  bH, "bO":  bO
-    }, indent=2))
-
-    try:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = pathlib.Path(td)
+        (tmp/"input.json").write_text(json.dumps({
+            "lr": lr_ppm, "steps": steps, "acc_bps": acc_bps,
+            "wIH": wIH, "bH": bH, "bO": bO
+        }, indent=2))
         subprocess.check_call([
             "node", str(CIRC_DIR/"generate_witness.js"),
             str(CIRC_DIR/"XorCircuit.wasm"),
@@ -358,112 +214,171 @@ with tempfile.TemporaryDirectory() as td:
             str(VK_JSON), str(tmp/"public.json"), str(tmp/"proof.json")
         ])
         print("   ✓ off-chain verification OK")
-    except subprocess.CalledProcessError as e:
-        print("   snarkjs failed with code", e.returncode); raise SystemExit(1)
+        proof          = json.loads((tmp/"proof.json").read_text())
+        public_signals = [int(x) for x in json.loads((tmp/"public.json").read_text())]
 
-    proof          = json.loads((tmp/"proof.json").read_text())
-    public_signals = [int(x) for x in json.loads((tmp/"public.json").read_text())]
-
-# 5) format proof for Solidity (swap inner limbs of B) & submit
-a = [int(proof["pi_a"][0]), int(proof["pi_a"][1])]
-b = [
-    [int(proof["pi_b"][0][1]), int(proof["pi_b"][0][0])],
-    [int(proof["pi_b"][1][1]), int(proof["pi_b"][1][0])]
-]
-c = [int(proof["pi_c"][0]), int(proof["pi_c"][1])]
-print("   pubSignals (lr,steps,acc_bps):", public_signals)
-
-try:
-    # Heavy path when last worker triggers settlement → use larger min_gas
+    a = [int(proof["pi_a"][0]), int(proof["pi_a"][1])]
+    b = [
+        [int(proof["pi_b"][0][1]), int(proof["pi_b"][0][0])],
+        [int(proof["pi_b"][1][1]), int(proof["pi_b"][1][0])]
+    ]
+    c = [int(proof["pi_c"][0]), int(proof["pi_c"][1])]
     send_tx(orch.functions.submitProof(REQ_ID, a, b, c, public_signals), min_gas=1_200_000)
-    print("   ✓ proof submitted")
-except RuntimeError as e:
-    msg = str(e)
-    if "bad proof" in msg:
-        print("   ❌ on-chain verifier rejected the proof: bad proof"); raise SystemExit(1)
-    if "already proven" in msg:
-        print("   task already proven; moving to settlement watch.")
-    elif "task not yours" in msg or "wrong index" in msg:
-        print("   not authorized for this hp index; exiting."); raise SystemExit(1)
-    elif "not started" in msg or "closed" in msg:
-        print(f"   cannot submit: {msg}; exiting."); raise SystemExit(0)
-    else:
-        print("   submitProof failed:", msg); raise SystemExit(1)
+    print(f"   ✓ submitted proof for task {idx}")
 
-# 6) wait for auto-settlement & withdraw (with clear stake/reward breakdown)
-while True:
+# Claim one task (preflight & parse event)
+def try_claim_one() -> Optional[int]:
+    # preflight: skip if it would revert
     try:
-        closed, bestAcc, winnersCount, perWinnerWei, perLoserWei = orch.functions.getResult(REQ_ID).call()
-        if closed:
-            winners = [orch.functions.winnerAt(REQ_ID, i).call() for i in range(winnersCount)]
-            my_credit = orch.functions.getCredit(REQ_ID, addr).call()
-
-            # Figure out if we are a winner by comparing our proven accuracy to bestAcc
-            try:
-                my_idx = orch.functions.taskOf(REQ_ID, addr).call()
-                my_acc = orch.functions.taskAcc(REQ_ID, my_idx).call()
-                am_winner = (int(my_acc) == int(bestAcc))
-            except Exception:
-                # Fallback: if we’re in winners list, treat as winner
-                am_winner = addr in winners
-
-            role = "WINNER" if am_winner else "LOSER"
-            expected_reward = perWinnerWei if am_winner else perLoserWei
-
-            # Try to learn stake amount:
-            stake_wei = None
-            # Preferred: public constant STAKE_WEI()
-            try:
-                stake_wei = int(orch.functions.STAKE_WEI().call())
-            except Exception:
-                # Fallback: public mapping stakeOf(id, addr)
-                try:
-                    stake_wei = int(orch.functions.stakeOf(REQ_ID, addr).call())
-                except Exception:
-                    stake_wei = None
-
-            # Compute breakdown
-            # If stake is known: assume full refund on success (you submitted a valid proof)
-            if stake_wei is not None:
-                # reward is "what's left" after the stake refund
-                # Note: winners may receive a few extra wei from remainder distribution
-                stake_refund = min(stake_wei, my_credit)
-                reward_amt   = my_credit - stake_refund
-                reward_note  = "" if reward_amt == expected_reward else " (incl. remainder)"
-            else:
-                # Stake unknown → approximate using expected reward
-                # Clamp to avoid negatives if rounding/remainder made total slightly smaller.
-                reward_amt   = min(expected_reward, my_credit)
-                stake_refund = my_credit - reward_amt
-                reward_note  = " (approx.)" if reward_amt != expected_reward else ""
-
-            print(f"[worker:{addr}] settled! bestAcc={bestAcc/100:.2f}% winners={winnersCount} "
-                  f"perWinner={w3.from_wei(perWinnerWei,'ether')} ETH perLoser={w3.from_wei(perLoserWei,'ether')} ETH")
-            print("   winners:", winners)
-            print(f"   role: {role}")
-            print(f"   stake refund: {w3.from_wei(int(stake_refund), 'ether')} ETH")
-            print(f"   reward:       {w3.from_wei(int(reward_amt),   'ether')} ETH{reward_note}")
-            print(f"   total credit: {w3.from_wei(int(my_credit),    'ether')} ETH")
-
-            if my_credit > 0:
-                print("   Withdrawing…")
-                try:
-                    send_tx(orch.functions.withdraw(REQ_ID), min_gas=120_000)
-                    print("   ✓ withdrawn")
-                except RuntimeError as e:
-                    msg = str(e)
-                    if "no credit" in msg:
-                        print("   race: no credit at withdraw time.")
-                    else:
-                        print("   withdraw failed:", msg)
-                finally:
-                    break
-            else:
-                print("   No payout for this address.")
-                break
-        print("   waiting for settlement…")
-        time.sleep(3)
+        orch.functions.claimTask(REQ_ID).call({"from": addr, "value": bond_wei})
     except Exception as e:
-        print("   getResult/winnerAt/getCredit failed (retrying):", e)
-        time.sleep(3)
+        msg = explain_web3_error(e)
+        if "no tasks left" in msg or "closed" in msg or "not started" in msg or "bond" in msg:
+            return None
+        # unknown issue
+        print("   claimTask preflight failed:", msg)
+        return None
 
+    # send TX
+    rcpt = send_tx(orch.functions.claimTask(REQ_ID), value=bond_wei, min_gas=230_000)
+    # parse event for idx
+    evs = orch.events.TaskClaimed().process_receipt(rcpt)
+    if evs:
+        idx = int(evs[-1]["args"]["idx"])
+        return idx
+
+    # fallback (shouldn’t hit; kept for safety)
+    n = space_len()
+    for i in range(n):
+        owner = orch.functions.taskOwner(REQ_ID, i).call()
+        acc   = orch.functions.taskAcc(REQ_ID, i).call()
+        if owner == addr and acc == 0:
+            return i
+    return None
+
+ZERO = "0x0000000000000000000000000000000000000000"
+
+def maybe_reassign_timeouts():
+    try:
+        n = space_len()
+        proven = count_proven(n)
+        now = chain_now()
+
+        # If exactly one task is left unproven, try immediate reassign on it.
+        if proven == n - 1:
+            for i in range(n):
+                acc = orch.functions.taskAcc(REQ_ID, i).call()
+                if acc != 0:
+                    continue
+                owner = orch.functions.taskOwner(REQ_ID, i).call()
+                if owner == ZERO:
+                    # It's already unassigned; outer loop will be able to claim it.
+                    continue
+                # Fast-path: contract will allow this (skips TTL & majority for last task).
+                try:
+                    # Preflight
+                    orch.functions.reassignTimedOut(REQ_ID, i).call({"from": addr})
+                except Exception:
+                    pass
+                else:
+                    try:
+                        send_tx(orch.functions.reassignTimedOut(REQ_ID, i), min_gas=180_000)
+                        print(f"   reassignTimedOut(last, {i})")
+                    except Exception:
+                        pass
+            return  # done; outer loop will attempt claim immediately
+
+        # Normal path: majority proven + TTL elapsed per task.
+        # (Contract still enforces both; we only preflight to avoid noisy reverts.)
+        for i in range(n):
+            acc = orch.functions.taskAcc(REQ_ID, i).call()
+            if acc != 0:
+                continue
+            owner = orch.functions.taskOwner(REQ_ID, i).call()
+            if owner == ZERO:
+                continue
+            t = orch.functions.claimedAt(REQ_ID, i).call()
+            if t == 0:
+                continue
+            remain = (t + ttl_sec) - now
+            if remain > 0:
+                # Keep it informative but not chatty.
+                print(f"   waiting TTL for idx {i}… {remain}s")
+                continue
+
+            # Preflight reassign
+            try:
+                orch.functions.reassignTimedOut(REQ_ID, i).call({"from": addr})
+            except Exception:
+                continue
+            try:
+                send_tx(orch.functions.reassignTimedOut(REQ_ID, i), min_gas=180_000)
+                print(f"   reassignTimedOut({i})")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+# Main loop
+while True:
+    claimed_any = False
+    while True:
+        idx = try_claim_one()
+        if idx is None:
+            break
+        claimed_any = True
+        lr_ppm, steps = orch.functions.getSpace(REQ_ID).call()[idx]
+        print(f"   claimed task {idx} (lr={lr_ppm}, steps={steps}) with bond {w3.from_wei(bond_wei,'ether')} ETH")
+        try:
+            do_task(int(idx), int(lr_ppm), int(steps))
+        except subprocess.CalledProcessError as e:
+            print(f"   snark/proof failed for task {idx}; it will time out and be reassignable.")
+        except Exception as e:
+            print(f"   task {idx} failed: {e}")
+
+    # closed?
+    closed, bestAcc, winTaskCount, perWinTaskWei, perLoseTaskWei = orch.functions.getResult(REQ_ID).call()
+    if closed:
+        break
+
+    # Help free stale tasks only when we didn’t claim anything this pass
+    if not claimed_any:
+        maybe_reassign_timeouts()
+
+    time.sleep(1.5)
+
+# Settlement summary
+closed, bestAcc, winTaskCount, perWinTaskWei, perLoseTaskWei = orch.functions.getResult(REQ_ID).call()
+space = orch.functions.getSpace(REQ_ID).call()
+
+my_total = my_proven = my_win = my_lose = 0
+for i in range(len(space)):
+    if orch.functions.taskOwner(REQ_ID, i).call() == addr:
+        my_total += 1
+        acc = int(orch.functions.taskAcc(REQ_ID, i).call())
+        if acc != 0:
+            my_proven += 1
+            if acc == int(bestAcc): my_win += 1
+            else:                   my_lose += 1
+
+my_credit = int(orch.functions.credit(REQ_ID, addr).call())  # direct mapping getter
+bond_refund = my_proven * bond_wei
+reward_expected = my_win * int(perWinTaskWei) + my_lose * int(perLoseTaskWei)
+note = "" if (bond_refund + reward_expected) == my_credit else " (incl. remainder)"
+
+print(f"[worker:{addr}] settled! bestAcc={bestAcc/100:.2f}% "
+      f"winnerTasks={winTaskCount} perWinnerTask={w3.from_wei(perWinTaskWei,'ether')} ETH "
+      f"perLoserTask={w3.from_wei(perLoseTaskWei,'ether')} ETH")
+print(f"   my tasks: total={my_total}, proven={my_proven}, wins={my_win}, loses={my_lose}")
+print(f"   bond refunds: {w3.from_wei(bond_refund,'ether')} ETH")
+print(f"   rewards:      {w3.from_wei(reward_expected,'ether')} ETH{note}")
+print(f"   total credit: {w3.from_wei(my_credit,'ether')} ETH")
+
+if my_credit > 0:
+    try:
+        send_tx(orch.functions.withdraw(REQ_ID), min_gas=120_000)
+        print("   ✓ withdrawn")
+    except Exception as e:
+        msg = explain_web3_error(e)
+        if "no credit" in msg: print("   (race) no credit left at withdraw time.")
+        else: print("   withdraw failed:", msg)
