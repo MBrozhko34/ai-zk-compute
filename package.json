@@ -11,5 +11,10 @@
   },
   "dependencies": {
     "@openzeppelin/contracts": "^5.4.0"
+  },
+
+  "scripts": {
+    "test:e2e": "mocha -r ts-node/register test/e2e/e2e.spec.ts --timeout 300000"
   }
 }
+
