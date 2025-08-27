@@ -40,6 +40,12 @@ acct: LocalAccount = Account.from_key(PRIV)
 orch = w3.eth.contract(address=w3.to_checksum_address(ORCH_ADDR),
                        abi=json.load(open(ABI_PATH))["abi"])
 
+# after creating `w3` and `acct` and before any txs:
+addr = acct.address
+bal0 = int(w3.eth.get_balance(addr))
+print(f"[worker:{addr}] starting on request {REQ_ID}…")
+print(f"   balance before: {w3.from_wei(bal0,'ether')} ETH")
+
 # ───────── err decode
 def _decode_error_string(data_hex: str) -> Optional[str]:
     try:
@@ -382,3 +388,8 @@ if my_credit > 0:
         msg = explain_web3_error(e)
         if "no credit" in msg: print("   (race) no credit left at withdraw time.")
         else: print("   withdraw failed:", msg)
+
+# right after a successful withdraw (or after settlement block, regardless of withdraw outcome)
+bal1 = int(w3.eth.get_balance(addr))
+delta = bal1 - bal0
+print(f"   balance after:  {w3.from_wei(bal1,'ether')} ETH (Δ {w3.from_wei(delta,'ether')} ETH)")
