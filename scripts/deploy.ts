@@ -16,8 +16,8 @@ async function main() {
   /* 1. current mined nonce */
   const baseNonce = await wallet.getNonce();
 
-  /* 2. Groth16Verifier */
-  const Verifier = await hre.ethers.getContractFactory("Groth16Verifier", wallet);
+  /* 2. PlonkVerifier */
+  const Verifier = await hre.ethers.getContractFactory("PlonkVerifier", wallet);
   const verifier = await Verifier.deploy({ nonce: baseNonce });
   await verifier.waitForDeployment();
   const verifierAddr = await verifier.getAddress();

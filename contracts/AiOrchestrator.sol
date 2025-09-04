@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.21;
 
-import "./Groth16Verifier.sol";
+import "./PlonkVerifier.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 contract AiOrchestrator is ReentrancyGuard {
@@ -27,13 +27,12 @@ contract AiOrchestrator is ReentrancyGuard {
     }
 
     /*────────────────── Constants ──────────────────*/
-    Groth16Verifier public immutable V;
+    PlonkVerifier public immutable V;
 
     // Per-claim bond (refunded on success, slashed on timeout)
     uint256 public constant CLAIM_BOND_WEI = 0.005 ether;
     // Claim timeout window (enable reassignment after majority proven)
     uint256 public constant CLAIM_TTL = 10; // seconds
-    uint256 public constant STALL_TTL = 60; // seconds (choose to taste)
 
     // Winner/loser weights for per-task split
     uint256 private constant WIN_W = 3;
@@ -62,9 +61,14 @@ contract AiOrchestrator is ReentrancyGuard {
     event TaskReassigned(uint256 id, uint256 idx, address prevClaimer, uint256 slashedWei, uint256 newBountyWei);
     event ProofAccepted(uint256 id, uint256 idx, address node, uint256 acc);
     event RequestClosed(uint256 id, uint256 bestAcc, uint256 winnerTaskCount, uint256 perWinnerTaskWei, uint256 perLoserTaskWei);
-    event BadProof(uint256 id, uint256 idx, address node, uint256 slashedWei);
 
-    constructor(address verifier) { V = Groth16Verifier(verifier); }
+    constructor(address verifier) { V = PlonkVerifier(verifier); }
+
+    /*────────────────── Guards ──────────────────*/
+    modifier ReqExists(uint256 id) {
+        require(R[id].client != address(0), "req/not-found");
+        _;
+    }
 
     /*────────────────── Client API ──────────────────*/
     function openRequest(
@@ -76,30 +80,19 @@ contract AiOrchestrator is ReentrancyGuard {
         require(msg.value > 0, "bounty=0");
         require(minWorkers > 0 && minWorkers <= grid.length, "bad minWorkers");
 
-        // Enforce uniqueness of (lr,steps) pairs
-        for (uint256 i; i < grid.length; ++i) {
-            for (uint256 j = i + 1; j < grid.length; ++j) {
-                require(
-                    !(grid[i].lr == grid[j].lr && grid[i].steps == grid[j].steps),
-                    "duplicate hp"
-                );
-            }
-        }
-
         id = nextId++;
         Request storage q = R[id];
         q.client     = msg.sender;
         q.datasetCID = cid;
         q.bountyWei  = msg.value;
         q.minWorkers = minWorkers;
-        for (uint256 k; k < grid.length; ++k) q.space.push(grid[k]);
+        for (uint256 i; i < grid.length; ++i) q.space.push(grid[i]);
 
         emit RequestOpened(id, grid.length, minWorkers, msg.value);
     }
 
     /*────────────────── Lobby ──────────────────*/
-    // Join allowed before or AFTER start. No stake at join; bond is per-claim.
-    function joinLobby(uint256 id) external nonReentrant {
+    function joinLobby(uint256 id) external nonReentrant ReqExists(id) {
         Request storage q = R[id];
         require(!q.closed, "closed");
         require(!joined[id][msg.sender], "already joined");
@@ -107,16 +100,12 @@ contract AiOrchestrator is ReentrancyGuard {
         joined[id][msg.sender] = true;
         q.lobby.push(msg.sender);
 
-        // start when threshold met (only once)
-        if (!q.started && q.lobby.length >= q.minWorkers) {
-            q.started = true;
-        }
+        if (!q.started && q.lobby.length >= q.minWorkers) q.started = true;
         emit LobbyJoined(id, msg.sender, q.lobby.length, q.minWorkers, q.started);
     }
 
-    // For clients/workers UI: needed = minWorkers, joinedCount = lobby size, ready = started
     function lobbyCounts(uint256 id)
-        external view
+        external view ReqExists(id)
         returns (uint256 needed, uint256 joinedCount, bool ready)
     {
         Request storage q = R[id];
@@ -124,8 +113,7 @@ contract AiOrchestrator is ReentrancyGuard {
     }
 
     /*────────────────── Worker API ──────────────────*/
-    // Pay a per-task bond and claim the next unassigned, unproven task.
-    function claimTask(uint256 id) external payable nonReentrant returns (uint256 idx) {
+    function claimTask(uint256 id) external payable nonReentrant ReqExists(id) returns (uint256 idx) {
         Request storage q = R[id];
         require(!q.closed, "closed");
         require(q.started, "not started");
@@ -145,10 +133,9 @@ contract AiOrchestrator is ReentrancyGuard {
         revert("no tasks left");
     }
 
-    /*────────────── Worker API (patched) ─────────────*/
     // Allow anyone to free a timed-out claim (majority proven & TTL),
     // OR immediately if this is the *last* remaining unproven task.
-    function reassignTimedOut(uint256 id, uint256 idx) external nonReentrant {
+    function reassignTimedOut(uint256 id, uint256 idx) external nonReentrant ReqExists(id) {
         Request storage q = R[id];
         require(q.started && !q.closed, "bad state");
         require(idx < q.space.length, "bad idx");
@@ -158,39 +145,28 @@ contract AiOrchestrator is ReentrancyGuard {
 
         bool lastUnproven = (_provenCount(id) == q.space.length - 1);
         if (!lastUnproven) {
-            uint256 t = claimedAt[id][idx];
-            // Normal path: majority proven + TTL
-            if (_majorityProven(id)) {
-                require(block.timestamp >= t + CLAIM_TTL, "not timed out");
-            } else {
-                // Stall path: allow after global stall timeout even without majority
-                require(block.timestamp >= t + STALL_TTL, "stall TTL");
-            }
+            require(_majorityProven(id), "majority not proven");
+            require(block.timestamp >= claimedAt[id][idx] + CLAIM_TTL, "not timed out");
         }
 
         uint256 b = taskBondWei[id][idx];
-        if (b > 0) {
-            q.bountyWei += b;
-            taskBondWei[id][idx] = 0;
-        }
+        if (b > 0) { q.bountyWei += b; taskBondWei[id][idx] = 0; }
         taskOwner[id][idx] = address(0);
         claimedAt[id][idx] = 0;
 
         emit TaskReassigned(id, idx, prev, b, q.bountyWei);
     }
 
-    // Submit ZK proof for your claimed task. Refunds your bond and (if last) settles rewards.
+    // Submit PLONK proof for your claimed task (fixed-size arrays).
     function submitProof(
         uint256 id,
-        uint256[2] calldata a,
-        uint256[2][2] calldata b,
-        uint256[2] calldata c,
-        uint256[3] calldata pubSig   // [lr, steps, acc_bps]
-    ) external nonReentrant {
+        uint256[24] calldata proof,      // PLONK proof as 24 field elements
+        uint256[3]  calldata pubSig      // [lr, steps, acc_bps]
+    ) external nonReentrant ReqExists(id) {
         Request storage q = R[id];
         require(q.started, "not started");
         require(!q.closed, "closed");
-        require(V.verifyProof(a, b, c, pubSig), "bad proof");
+        require(V.verifyProof(proof, pubSig), "bad proof");
 
         // locate task idx by (lr,steps)
         uint256 idx; bool found;
@@ -203,64 +179,11 @@ contract AiOrchestrator is ReentrancyGuard {
 
         taskAcc[id][idx] = pubSig[2];
 
-        // refund bond into your credit
         uint256 bnd = taskBondWei[id][idx];
-        if (bnd > 0) {
-            credit[id][msg.sender] += bnd;
-            taskBondWei[id][idx] = 0;
-        }
+        if (bnd > 0) { credit[id][msg.sender] += bnd; taskBondWei[id][idx] = 0; }
 
         emit ProofAccepted(id, idx, msg.sender, pubSig[2]);
 
-        // if all tasks proven → compute settlement once
-        if (_allProven(id)) _computeSettlement(id);
-    }
-
-    function submitProofOrSlash(
-        uint256 id,
-        uint256 idx,
-        uint256[2] calldata a,
-        uint256[2][2] calldata b,
-        uint256[2] calldata c,
-        uint256[3] calldata pubSig   // [lr, steps, acc_bps]
-    ) external nonReentrant {
-        Request storage q = R[id];
-        require(q.started && !q.closed, "bad state");
-        require(idx < q.space.length, "bad idx");
-        require(taskOwner[id][idx] == msg.sender, "task not yours");
-
-        // Require that pubSig matches the claimed index to prevent cross-index shenanigans
-        require(
-            pubSig[0] == q.space[idx].lr && pubSig[1] == q.space[idx].steps,
-            "pubSig mismatch"
-        );
-
-        // If the proof is invalid: slash bond, free the claim, emit, and return
-        if (!V.verifyProof(a, b, c, pubSig)) {
-            uint256 bnd = taskBondWei[id][idx];
-            if (bnd > 0) {
-                q.bountyWei += bnd;
-                taskBondWei[id][idx] = 0;
-            }
-            address prev = taskOwner[id][idx];
-            taskOwner[id][idx] = address(0);
-            claimedAt[id][idx] = 0;
-            emit BadProof(id, idx, prev, bnd);
-            return;
-        }
-
-        // Valid proof ⇒ accept (same as submitProof)
-        require(taskAcc[id][idx] == 0, "already proven");
-        taskAcc[id][idx] = pubSig[2];
-
-        // refund bond
-        uint256 bndOk = taskBondWei[id][idx];
-        if (bndOk > 0) {
-            credit[id][msg.sender] += bndOk;
-            taskBondWei[id][idx] = 0;
-        }
-
-        emit ProofAccepted(id, idx, msg.sender, pubSig[2]);
         if (_allProven(id)) _computeSettlement(id);
     }
 
@@ -284,15 +207,12 @@ contract AiOrchestrator is ReentrancyGuard {
         return (p * 2) > n;
     }
 
-    // Per-task split: winners (acc == best) get WIN_W × unit, losers get LOS_W × unit
-    // Credits are assigned per task, so multi-task workers earn the sum.
     function _computeSettlement(uint256 id) internal {
         Request storage q = R[id];
         require(!q.closed, "already closed");
 
         uint256 n = q.space.length;
 
-        // best accuracy
         uint256 best;
         for (uint256 i; i < n; ++i) {
             uint256 a = taskAcc[id][i];
@@ -300,42 +220,32 @@ contract AiOrchestrator is ReentrancyGuard {
         }
         q.bestAcc = best;
 
-        // count winner tasks vs loser tasks
         uint256 winTasks;
         uint256 loseTasks;
         for (uint256 i; i < n; ++i) {
-            uint256 a = taskAcc[id][i];
-            if (a == best) winTasks++;
-            else loseTasks++;
+            if (taskAcc[id][i] == best) winTasks++; else loseTasks++;
         }
 
-        // compute per-task amounts
         uint256 totalWeight = winTasks * WIN_W + loseTasks * LOS_W;
-        // guard (shouldn't happen because all tasks proven → winTasks>0)
         if (totalWeight == 0) { q.closed = true; return; }
 
         uint256 unit = q.bountyWei / totalWeight;
         q.perWinnerTaskWei = unit * WIN_W;
         q.perLoserTaskWei  = unit * LOS_W;
 
-        // assign credits per task
         uint256 distributed;
         for (uint256 i; i < n; ++i) {
             address w = taskOwner[id][i];
-            if (w == address(0)) continue; // defensive
+            if (w == address(0)) continue;
             bool isWin = (taskAcc[id][i] == best);
             uint256 amt = isWin ? q.perWinnerTaskWei : q.perLoserTaskWei;
             credit[id][w] += amt;
             distributed += amt;
         }
 
-        // remainder wei → sprinkle over winning tasks to favor winners
         uint256 remainder = q.bountyWei - distributed;
         for (uint256 i; i < n && remainder > 0; ++i) {
-            if (taskAcc[id][i] == best) {
-                credit[id][taskOwner[id][i]] += 1;
-                remainder -= 1;
-            }
+            if (taskAcc[id][i] == best) { credit[id][taskOwner[id][i]] += 1; remainder -= 1; }
         }
 
         q.closed = true;
@@ -343,7 +253,7 @@ contract AiOrchestrator is ReentrancyGuard {
     }
 
     /*────────────────── Withdraw (pull payments) ──────────────────*/
-    function withdraw(uint256 id) external nonReentrant {
+    function withdraw(uint256 id) external nonReentrant ReqExists(id) {
         uint256 amt = credit[id][msg.sender];
         require(amt > 0, "no credit");
         credit[id][msg.sender] = 0;
@@ -352,16 +262,14 @@ contract AiOrchestrator is ReentrancyGuard {
     }
 
     /*────────────────── Views ──────────────────*/
-    function getSpace(uint256 id) external view returns (HyperParam[] memory) { return R[id].space; }
+    function getSpace(uint256 id) external view ReqExists(id) returns (HyperParam[] memory) { return R[id].space; }
 
-    // NEW: public wrapper for internal _provenCount (for clients/agents)
-    function provenCount(uint256 id) external view returns (uint256) {
+    function provenCount(uint256 id) external view ReqExists(id) returns (uint256) {
         return _provenCount(id);
     }
 
-    // Useful stats for UIs/clients
     function taskStatsOf(uint256 id, address who)
-        external view
+        external view ReqExists(id)
         returns (uint256 totalTasks, uint256 provenTasks, uint256 winTasks, uint256 loseTasks)
     {
         Request storage q = R[id];
@@ -376,8 +284,7 @@ contract AiOrchestrator is ReentrancyGuard {
         }
     }
 
-    // UPDATED: always count winner tasks, even when bestAcc == 0
-    function getResult(uint256 id) external view returns (
+    function getResult(uint256 id) external view ReqExists(id) returns (
         bool closed,
         uint256 bestAcc,
         uint256 winnerTaskCount,

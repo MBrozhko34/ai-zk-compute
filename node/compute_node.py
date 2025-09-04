@@ -21,6 +21,59 @@ CIRC_DIR  = pathlib.Path("../circuits/XorCircuit_js")
 ABI_PATH  = pathlib.Path("../artifacts/contracts/AiOrchestrator.sol/AiOrchestrator.json")
 assert ORCH_ADDR and PRIV, "ORCH_ADDR & PRIVATE_KEY required"
 
+# ---- robust parser for snarkjs calldata (handles "two arrays on one line") ----
+def _to_int(x):
+    if isinstance(x, int):
+        return x
+    s = str(x)
+    if s.startswith(("0x", "0X")):
+        return int(s, 16)
+    return int(s)
+
+def parse_plonk_calldata_arrays(txt: str):
+    """
+    Returns (proof24, pub3) as lists of ints.
+    Works whether snarkjs prints:
+      - two arrays on separate lines, OR
+      - both arrays on a single line.
+    """
+    # collect all top-level JSON arrays by bracket depth
+    arr_strings = []
+    depth = 0
+    start = -1
+    for i, ch in enumerate(txt):
+        if ch == "[":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "]":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start != -1:
+                    arr_strings.append(txt[start:i+1])
+                    start = -1
+
+    # fallbacks (just in case)
+    if len(arr_strings) < 2:
+        for line in txt.splitlines():
+            line = line.strip()
+            if line.startswith("[") and line.endswith("]"):
+                arr_strings.append(line)
+
+    if len(arr_strings) < 2:
+        raise RuntimeError(f"Unexpected soliditycalldata output: {txt[:200]}...")
+
+    proof_arr  = [_to_int(x) for x in json.loads(arr_strings[0])]
+    pub_signals = [_to_int(x) for x in json.loads(arr_strings[1])]
+
+    if len(proof_arr) != 24:
+        raise RuntimeError(f"Proof array length {len(proof_arr)} != 24")
+    if len(pub_signals) != 3:
+        raise RuntimeError(f"pubSignals length {len(pub_signals)} != 3")
+
+    return proof_arr, pub_signals
+
+
 # ───────── helpers (mirror circuit)
 def bin01_list(tensor_flat):
     return [1 if float(v) > 0.0 else 0 for v in tensor_flat]
@@ -174,7 +227,7 @@ while True:
     except Exception as e:
         print("   lobbyCounts() failed:", explain_web3_error(e)); time.sleep(1.5)
 
-# Train/prove/submit helper
+# Train/prove/submit helper – PLONK (fixed arrays)
 def do_task(idx: int, lr_ppm: int, steps: int):
     seed = int.from_bytes(hashlib.sha256(f"{lr_ppm}:{steps}".encode()).digest()[:8], "big")
     torch.manual_seed(seed)
@@ -203,33 +256,40 @@ def do_task(idx: int, lr_ppm: int, steps: int):
             "lr": lr_ppm, "steps": steps, "acc_bps": acc_bps,
             "wIH": wIH, "bH": bH, "bO": bO
         }, indent=2))
+
+        # witness
         subprocess.check_call([
             "node", str(CIRC_DIR/"generate_witness.js"),
             str(CIRC_DIR/"XorCircuit.wasm"),
             str(tmp/"input.json"),
             str(tmp/"witness.wtns")
         ])
+
+        # PLONK prove + verify
         subprocess.check_call([
-            "snarkjs", "groth16", "prove",
+            "snarkjs", "plonk", "prove",
             str(ZKEY), str(tmp/"witness.wtns"),
             str(tmp/"proof.json"), str(tmp/"public.json")
         ])
         print("   verifying off-chain with snarkjs…")
         subprocess.check_call([
-            "snarkjs", "groth16", "verify",
+            "snarkjs", "plonk", "verify",
             str(VK_JSON), str(tmp/"public.json"), str(tmp/"proof.json")
         ])
         print("   ✓ off-chain verification OK")
-        proof          = json.loads((tmp/"proof.json").read_text())
-        public_signals = [int(x) for x in json.loads((tmp/"public.json").read_text())]
 
-    a = [int(proof["pi_a"][0]), int(proof["pi_a"][1])]
-    b = [
-        [int(proof["pi_b"][0][1]), int(proof["pi_b"][0][0])],
-        [int(proof["pi_b"][1][1]), int(proof["pi_b"][1][0])]
-    ]
-    c = [int(proof["pi_c"][0]), int(proof["pi_c"][1])]
-    send_tx(orch.functions.submitProofOrSlash(REQ_ID, idx, a, b, c, public_signals), min_gas=1_200_000)
+        # Export calldata in ARRAY form (uint256[24], uint256[3])
+        raw = subprocess.check_output([
+            "snarkjs", "zkey", "export", "soliditycalldata",
+            str(tmp/"public.json"), str(tmp/"proof.json")
+        ]).decode()
+
+    # Robustly parse even when snarkjs prints two arrays on one line
+    proof_arr, public_signals = parse_plonk_calldata_arrays(raw)
+
+    # Submit to the contract (fits uint256[24], uint256[3])
+    send_tx(orch.functions.submitProof(REQ_ID, proof_arr, public_signals),
+            min_gas=1_200_000)
     print(f"   ✓ submitted proof for task {idx}")
 
 # Claim one task (preflight & parse event)
