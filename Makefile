@@ -7,12 +7,19 @@ deps:
 
 clear:
 	pnpm hardhat clean
-	rm -rf circuits/XorCircuit_js circuits/*.zkey circuits/*.r1cs circuits/*.sym contracts/Groth16Verifier.sol
+	rm -rf circuits/XorCircuit_js circuits/*.zkey circuits/*.r1cs circuits/*.sym contracts/Groth16Verifier.sol contracts/PlonkVerifier.sol
 
-circuit:
+plonk-circuit:
 	cd circuits && \
 		circom XorCircuit.circom --r1cs --wasm --sym -l ./lib && \
-		snarkjs groth16 setup XorCircuit.r1cs powersOfTau28_hez_final_10.ptau xor_000.zkey && \
+		snarkjs plonk setup XorCircuit.r1cs pot18_final.ptau xor_final.zkey && \
+		snarkjs zkey export verificationkey xor_final.zkey verification_key.json && \
+		snarkjs zkey export solidityverifier xor_final.zkey ../contracts/PlonkVerifier.sol
+
+groth-circuit:
+	cd circuits && \
+		circom XorCircuit.circom --r1cs --wasm --sym -l ./lib && \
+		snarkjs groth16 setup XorCircuit.r1cs pot18_final.ptau xor_000.zkey && \
 		snarkjs zkey contribute xor_000.zkey xor_final.zkey --name="initial setup" -e="random entropy" && \
 		snarkjs zkey export verificationkey xor_final.zkey verification_key.json && \
 		snarkjs zkey export solidityverifier xor_final.zkey ../contracts/Groth16Verifier.sol
@@ -45,8 +52,3 @@ worker:
 	cd node && \
 		RPC_URL="$(RPC_URL)" ORCH_ADDR="$(ORCH_ADDR)" REQUEST_ID="$(REQUEST_ID)" PRIVATE_KEY="$(PRIVATE_KEY)" \
 		.venv/bin/python compute_node.py
-
-
-
-
-

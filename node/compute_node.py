@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
-"""Join lobby, wait for start (minWorkers), claim tasks with bond, train XOR, prove (Groth16),
-auto-settlement on last proof, reclaim timed-out tasks using chain time, then withdraw payout."""
-import json, os, subprocess, tempfile, pathlib, time, hashlib
-from typing import Optional, List
+"""
+Join lobby, wait for start (minWorkers), claim tasks with bond,
+train the shared XOR model *deterministically inside the circuit spec* (XorTrain),
+produce a Groth16 proof, auto-settle on last proof, reclaim timed-out tasks using chain time,
+then withdraw payout.
+
+Public signals: [lr (ppm), steps (epochs), acc_bps].
+"""
+
+import json, os, subprocess, tempfile, pathlib, time
+from typing import Optional, List, Tuple
 
 from web3 import Web3, HTTPProvider
 from eth_account import Account
 from eth_account.signers.local import LocalAccount
-import torch, torch.nn as nn
 
 # ───────── env
 RPC_URL   = os.getenv("RPC_URL", "http://127.0.0.1:8545")
@@ -21,18 +27,135 @@ CIRC_DIR  = pathlib.Path("../circuits/XorCircuit_js")
 ABI_PATH  = pathlib.Path("../artifacts/contracts/AiOrchestrator.sol/AiOrchestrator.json")
 assert ORCH_ADDR and PRIV, "ORCH_ADDR & PRIVATE_KEY required"
 
-# ───────── helpers (mirror circuit)
-def bin01_list(tensor_flat):
-    return [1 if float(v) > 0.0 else 0 for v in tensor_flat]
+# ───────── robust Groth16 calldata parser
+def _to_int(x):
+    if isinstance(x, int): return x
+    if isinstance(x, str):
+        x = x.strip()
+        return int(x, 16) if x.lower().startswith("0x") else int(x)
+    raise TypeError(f"bad numeric {type(x)}")
 
-clamp3 = lambda x: min(max(int(x), 0), 3)
-def xor_forward(x0, x1, wIH, bH, bO):
-    h0 = clamp3(wIH[0]*x0 + wIH[1]*x1 + bH[0])
-    h1 = clamp3(wIH[2]*x0 + wIH[3]*x1 + bH[1])
-    s0 = 1 if h0 >= 1 else 0
-    s1 = 1 if h1 >= 1 else 0
-    o  = clamp3(s0 - s1 + bO)
-    return 1 if o >= 1 else 0
+def _first_json_array_slice(s: str) -> str:
+    s = s.strip()
+    b = s.find('[')
+    if b == -1: raise RuntimeError("calldata: '[' not found")
+    depth = 0; e = None
+    for i, c in enumerate(s[b:], start=b):
+        if c == '[': depth += 1
+        elif c == ']':
+            depth -= 1
+            if depth == 0: e = i; break
+    if e is None: raise RuntimeError("calldata: unmatched ']'")
+    return s[b:e+1]
+
+def parse_groth16_calldata(raw: str):
+    """
+    Parse snarkjs 'zkey export soliditycalldata' output.
+
+    Handles both:
+      a) four arrays separated by commas (classic snarkjs):  a,b,c,inputs
+      b) already wrapped in one array:                      [a,b,c,inputs]
+    """
+    txt = raw.strip()
+
+    def _try_json(s):
+        try:
+            return json.loads(s)
+        except Exception:
+            return None
+
+    parsed = _try_json(txt)
+    if parsed is None:
+        # classic output isn't valid JSON until we wrap it
+        parsed = _try_json(f"[{txt}]")
+    if parsed is None:
+        raise RuntimeError(f"cannot parse groth16 calldata: {txt[:160]}…")
+
+    # Normalize to [a,b,c,inputs]
+    if isinstance(parsed, list) and len(parsed) == 4 and all(isinstance(x, list) for x in parsed):
+        a_raw, b_raw, c_raw, inputs_raw = parsed
+    elif isinstance(parsed, list) and len(parsed) == 1 and isinstance(parsed[0], list) and len(parsed[0]) == 4:
+        a_raw, b_raw, c_raw, inputs_raw = parsed[0]
+    else:
+        raise RuntimeError(f"unexpected groth16 calldata shape (len={len(parsed)})")
+
+    def _to_int(x):
+        if isinstance(x, int): return x
+        if isinstance(x, str):
+            s = x.strip()
+            return int(s, 16) if s.lower().startswith("0x") else int(s)
+        raise TypeError(f"bad numeric {type(x)}")
+
+    a = [_to_int(x) for x in a_raw]                     # 2
+    b = [[_to_int(x) for x in row] for row in b_raw]    # 2x2
+    c = [_to_int(x) for x in c_raw]                     # 2
+    inputs = [_to_int(x) for x in inputs_raw]           # 3 here
+
+    if len(a) != 2 or len(c) != 2 or len(b) != 2 or any(len(row) != 2 for row in b):
+        raise RuntimeError("bad (a,b,c) shapes")
+
+    return a, b, c, inputs
+
+
+# ───────── circuit-mirroring helpers (must match XorTrain in the circuit)
+def step_gate(v: int) -> int:
+    # Step() outputs 1 iff in >= 1
+    return 1 if v >= 1 else 0
+
+def lr_bucket(lr_ppm: int) -> int:
+    # 1 + [lr >= 50k] + [lr >= 100k] ⇒ {1,2,3}
+    return 1 + (1 if lr_ppm >= 50_000 else 0) + (1 if lr_ppm >= 100_000 else 0)
+
+def sat_add3_floor(x: int, inc: int, dec: int, delta: int, floor: int = 0) -> int:
+    # clamp add to 3, then subtract; saturate at 'floor'
+    x_cap = x + inc * delta
+    if x_cap > 3: x_cap = 3
+    sub = dec * delta
+    if x_cap - sub < floor: return floor
+    return x_cap - sub
+
+def train_and_eval(lr_ppm: int, steps: int, max_epochs: int = 300) -> int:
+    # init per circuit
+    w0 = w1 = w2 = w3 = 1
+    b0 = b1 = 0
+    bO = 1  # floor = 1
+    X = [(0,0),(1,0),(0,1),(1,1)]
+    Y = [0,1,1,0]
+    L = lr_bucket(lr_ppm)
+    T = min(int(steps), max_epochs)
+
+    for _e in range(T):
+        for (x0,x1), y in zip(X, Y):
+            s0 = step_gate(w0*x0 + w1*x1 + b0)
+            s1 = step_gate(w2*x0 + w3*x1 + b1)
+            o  = step_gate(s0 - s1 + bO)
+
+            pos = (1 - o) * y
+            neg = (1 - y) * o
+
+            d0 = L * x0
+            d1 = L * x1
+
+            # hidden0 follows pos/neg
+            w0 = sat_add3_floor(w0, pos, neg, d0, 0)
+            w1 = sat_add3_floor(w1, pos, neg, d1, 0)
+            b0 = sat_add3_floor(b0, pos, neg, L,  0)
+
+            # hidden1 opposite
+            w2 = sat_add3_floor(w2, neg, pos, d0, 0)
+            w3 = sat_add3_floor(w3, neg, pos, d1, 0)
+            b1 = sat_add3_floor(b1, neg, pos, L,  0)
+
+            # output bias follows hidden0, floor=1
+            bO = sat_add3_floor(bO, pos, neg, L,  1)
+
+    correct = 0
+    for (x0,x1), y in zip(X, Y):
+        s0 = step_gate(w0*x0 + w1*x1 + b0)
+        s1 = step_gate(w2*x0 + w3*x1 + b1)
+        o  = step_gate(s0 - s1 + bO)
+        correct += int(o == y)
+    return correct * 2500  # basis points
 
 # ───────── chain handles
 w3: Web3 = Web3(HTTPProvider(RPC_URL))
@@ -40,17 +163,15 @@ acct: LocalAccount = Account.from_key(PRIV)
 orch = w3.eth.contract(address=w3.to_checksum_address(ORCH_ADDR),
                        abi=json.load(open(ABI_PATH))["abi"])
 
-# after creating `w3` and `acct` and before any txs:
 addr = acct.address
 bal0 = int(w3.eth.get_balance(addr))
 print(f"[worker:{addr}] starting on request {REQ_ID}…")
 print(f"   balance before: {w3.from_wei(bal0,'ether')} ETH")
 
 # ───────── err decode
-def _decode_error_string(data_hex: str) -> Optional[str]:
+def _decode_error_string(data_hex: str):
     try:
-        if not data_hex or not data_hex.startswith("0x"):
-            return None
+        if not data_hex or not data_hex.startswith("0x"): return None
         b = bytes.fromhex(data_hex[2:])
         if len(b) < 4: return None
         sel = b[:4]
@@ -59,37 +180,35 @@ def _decode_error_string(data_hex: str) -> Optional[str]:
                 strlen = int.from_bytes(b[4+32:4+32+32], "big")
                 s = b[4+32+32:4+32+32+strlen]
                 return s.decode("utf-8", errors="replace")
-        elif sel == bytes.fromhex("4e487b71"):
-            return "panic()"
-        elif sel == bytes.fromhex("3ee5aeb5"):
-            return "ReentrancyGuardReentrantCall()"
+        elif sel == bytes.fromhex("4e487b71"): return "panic()"
+        elif sel == bytes.fromhex("3ee5aeb5"): return "ReentrancyGuardReentrantCall()"
         return None
     except Exception:
         return None
 
 def explain_web3_error(e: Exception) -> str:
     if isinstance(e, ValueError) and e.args and isinstance(e.args[0], dict):
-        err = e.args[0]; msg = err.get("message",""); data = err.get("data")
+        err = e.args[0]; data = err.get("data")
         if isinstance(data, dict):
             s = _decode_error_string(data.get("data") or "")
             if s: return f"revert '{s}'"
         elif isinstance(data, str):
             s = _decode_error_string(data)
             if s: return f"revert '{s}'"
-        return msg or str(e)
+        return err.get("message","") or str(e)
     return str(e)
 
 # ───────── tx helpers
 def next_nonce() -> int:
     return w3.eth.get_transaction_count(acct.address, "pending")
 
-def send_tx(fn_call, *, value: int = 0, min_gas: int = 200_000, headroom_num: int = 15, headroom_den: int = 10):
+def send_tx(fn_call, *, value: int = 0, min_gas: int = 220_000, headroom_num: int = 15, headroom_den: int = 10):
     try:
         est = int(fn_call.estimate_gas({"from": acct.address, "value": value}))
         gas_limit = max(min_gas, est * headroom_num // headroom_den)
     except Exception as e:
         print("   gas estimation failed, defaulting:", explain_web3_error(e))
-        gas_limit = max(min_gas, 2_500_000)
+        gas_limit = max(min_gas, 3_000_000)
 
     n_retries = 0
     while True:
@@ -109,8 +228,7 @@ def send_tx(fn_call, *, value: int = 0, min_gas: int = 200_000, headroom_num: in
             if any(x in msg for x in ["nonce too low", "already known", "replacement transaction underpriced"]):
                 n_retries += 1
                 if n_retries <= 3:
-                    time.sleep(0.5)
-                    continue
+                    time.sleep(0.5); continue
             if "ran out of gas" in msg.lower() or "intrinsic gas too low" in msg.lower():
                 raise RuntimeError(f"OOG — try higher gas. Details: {msg}") from e
             raise RuntimeError(msg) from e
@@ -123,17 +241,9 @@ def space_len() -> int:
     return len(orch.functions.getSpace(REQ_ID).call())
 
 def count_proven(n: int) -> int:
-    c = 0
-    for i in range(n):
-        if orch.functions.taskAcc(REQ_ID, i).call() != 0:
-            c += 1
-    return c
+    return sum(1 for i in range(n) if orch.functions.taskAcc(REQ_ID, i).call() != 0)
 
-# ───────── workflow
-addr = acct.address
-print(f"[worker:{addr}] starting on request {REQ_ID}…")
-
-# Early exit if already closed
+# ───────── lobby
 try:
     closed, *_ = orch.functions.getResult(REQ_ID).call()
     if closed:
@@ -142,19 +252,10 @@ try:
 except Exception as e:
     print("   warning: getResult() failed (continuing):", explain_web3_error(e))
 
-# bond / ttl
-try:
-    bond_wei = int(orch.functions.CLAIM_BOND_WEI().call())
-    ttl_sec  = int(orch.functions.CLAIM_TTL().call())
-except Exception:
-    bond_wei = int(Web3.to_wei(0.005, "ether")); ttl_sec = 10
-
-# 0) join
 try:
     if orch.functions.joined(REQ_ID, addr).call():
         print("   already joined lobby.")
     else:
-        # preflight join
         orch.functions.joinLobby(REQ_ID).call({"from": addr})
         send_tx(orch.functions.joinLobby(REQ_ID))
         print("   ✓ joined lobby")
@@ -164,96 +265,89 @@ except Exception as e:
     elif "closed" in msg:      print("   request closed; exiting."); raise SystemExit(0)
     else:                      print("   joinLobby failed:", msg);  raise SystemExit(1)
 
-# 0b) wait for start
 while True:
     try:
-        needed, joined, ready = orch.functions.lobbyCounts(REQ_ID).call()
-        print(f"   lobby: {joined}/{needed} ready={ready}")
+        needed, joined_, ready = orch.functions.lobbyCounts(REQ_ID).call()
+        print(f"   lobby: {joined_}/{needed} ready={ready}")
         if ready: break
         time.sleep(1.5)
     except Exception as e:
         print("   lobbyCounts() failed:", explain_web3_error(e)); time.sleep(1.5)
 
-# Train/prove/submit helper
+# bond / ttl
+try:
+    bond_wei   = int(orch.functions.CLAIM_BOND_WEI().call())
+    claim_ttl  = int(orch.functions.CLAIM_TTL().call())
+    stall_ttl  = int(orch.functions.STALL_TTL().call())
+except Exception:
+    bond_wei  = int(Web3.to_wei(0.005, "ether"))
+    claim_ttl = 10
+    stall_ttl = 60
+
+# ───────── train/prove/submit for complex circuit (Groth16)
 def do_task(idx: int, lr_ppm: int, steps: int):
-    seed = int.from_bytes(hashlib.sha256(f"{lr_ppm}:{steps}".encode()).digest()[:8], "big")
-    torch.manual_seed(seed)
-
-    X = torch.tensor([[0,0],[1,0],[0,1],[1,1]], dtype=torch.float32)
-    y = torch.tensor([[0],[1],[1],[0]], dtype=torch.float32)
-
-    net = nn.Sequential(nn.Linear(2,2), nn.Sigmoid(),
-                        nn.Linear(2,1), nn.Sigmoid())
-    opt = torch.optim.SGD(net.parameters(), lr_ppm/1_000_000)
-    crit = nn.BCELoss()
-    for _ in range(int(steps)):
-        opt.zero_grad(); crit(net(X),y).backward(); opt.step()
-
-    wIH = bin01_list(net[0].weight.detach().flatten().tolist())
-    bH  = bin01_list(net[0].bias.detach().flatten().tolist())
-    bO  = 1
-    preds   = [xor_forward(*xy, wIH, bH, bO) for xy in [(0,0),(1,0),(0,1),(1,1)]]
-    correct = sum(int(p==t) for p,t in zip(preds, [0,1,1,0]))
-    acc_bps = correct * 2500
-    print(f"   [task {idx}] acc = {correct}/4 → {acc_bps/100}%")
+    acc_bps = train_and_eval(lr_ppm, steps)
+    print(f"   [task {idx}] trained {min(steps,300)} epochs (bucket={lr_bucket(lr_ppm)}) → acc {acc_bps/100}%")
 
     with tempfile.TemporaryDirectory() as td:
         tmp = pathlib.Path(td)
+
         (tmp/"input.json").write_text(json.dumps({
-            "lr": lr_ppm, "steps": steps, "acc_bps": acc_bps,
-            "wIH": wIH, "bH": bH, "bO": bO
+            "lr": lr_ppm, "steps": steps, "acc_bps": acc_bps
         }, indent=2))
+
+        # Witness (complex circuit's wasm)
         subprocess.check_call([
             "node", str(CIRC_DIR/"generate_witness.js"),
             str(CIRC_DIR/"XorCircuit.wasm"),
             str(tmp/"input.json"),
             str(tmp/"witness.wtns")
         ])
+
+        # Groth16 prove + verify off-chain
         subprocess.check_call([
             "snarkjs", "groth16", "prove",
             str(ZKEY), str(tmp/"witness.wtns"),
             str(tmp/"proof.json"), str(tmp/"public.json")
         ])
-        print("   verifying off-chain with snarkjs…")
+        print("   verifying off-chain (groth16)…")
         subprocess.check_call([
             "snarkjs", "groth16", "verify",
             str(VK_JSON), str(tmp/"public.json"), str(tmp/"proof.json")
         ])
         print("   ✓ off-chain verification OK")
-        proof          = json.loads((tmp/"proof.json").read_text())
-        public_signals = [int(x) for x in json.loads((tmp/"public.json").read_text())]
 
-    a = [int(proof["pi_a"][0]), int(proof["pi_a"][1])]
-    b = [
-        [int(proof["pi_b"][0][1]), int(proof["pi_b"][0][0])],
-        [int(proof["pi_b"][1][1]), int(proof["pi_b"][1][0])]
-    ]
-    c = [int(proof["pi_c"][0]), int(proof["pi_c"][1])]
-    send_tx(orch.functions.submitProofOrSlash(REQ_ID, idx, a, b, c, public_signals), min_gas=1_200_000)
+        # Export calldata for on-chain
+        raw = subprocess.check_output([
+            "snarkjs", "zkey", "export", "soliditycalldata",
+            str(tmp/"public.json"), str(tmp/"proof.json")
+        ]).decode()
+
+    a, b, c, inputs = parse_groth16_calldata(raw)
+    if len(inputs) != 3:
+        raise RuntimeError(f"expected 3 public inputs [lr,steps,acc_bps], got {len(inputs)}")
+
+    # submit using the slash-on-failure path (safer)
+    send_tx(orch.functions.submitProofOrSlash(REQ_ID, idx, a, b, c, inputs), min_gas=650_000)
     print(f"   ✓ submitted proof for task {idx}")
 
-# Claim one task (preflight & parse event)
+# ───────── claim & timeout logic
 def try_claim_one() -> Optional[int]:
-    # preflight: skip if it would revert
     try:
         orch.functions.claimTask(REQ_ID).call({"from": addr, "value": bond_wei})
     except Exception as e:
         msg = explain_web3_error(e)
         if "no tasks left" in msg or "closed" in msg or "not started" in msg or "bond" in msg:
             return None
-        # unknown issue
         print("   claimTask preflight failed:", msg)
         return None
 
-    # send TX
     rcpt = send_tx(orch.functions.claimTask(REQ_ID), value=bond_wei, min_gas=230_000)
-    # parse event for idx
     evs = orch.events.TaskClaimed().process_receipt(rcpt)
     if evs:
-        idx = int(evs[-1]["args"]["idx"])
-        return idx
+        return int(evs[-1]["args"]["idx"])
 
-    # fallback (shouldn’t hit; kept for safety)
+    # fallback scan
     n = space_len()
     for i in range(n):
         owner = orch.functions.taskOwner(REQ_ID, i).call()
@@ -269,20 +363,17 @@ def maybe_reassign_timeouts():
         n = space_len()
         proven = count_proven(n)
         now = chain_now()
+        majority = (proven * 2) > n
+        ttl = claim_ttl if majority else stall_ttl
 
-        # If exactly one task is left unproven, try immediate reassign on it.
         if proven == n - 1:
+            # Fast-path: last unproven can be freed immediately
             for i in range(n):
                 acc = orch.functions.taskAcc(REQ_ID, i).call()
-                if acc != 0:
-                    continue
+                if acc != 0: continue
                 owner = orch.functions.taskOwner(REQ_ID, i).call()
-                if owner == ZERO:
-                    # It's already unassigned; outer loop will be able to claim it.
-                    continue
-                # Fast-path: contract will allow this (skips TTL & majority for last task).
+                if owner == ZERO: continue
                 try:
-                    # Preflight
                     orch.functions.reassignTimedOut(REQ_ID, i).call({"from": addr})
                 except Exception:
                     pass
@@ -292,27 +383,19 @@ def maybe_reassign_timeouts():
                         print(f"   reassignTimedOut(last, {i})")
                     except Exception:
                         pass
-            return  # done; outer loop will attempt claim immediately
+            return
 
-        # Normal path: majority proven + TTL elapsed per task.
-        # (Contract still enforces both; we only preflight to avoid noisy reverts.)
         for i in range(n):
             acc = orch.functions.taskAcc(REQ_ID, i).call()
-            if acc != 0:
-                continue
+            if acc != 0: continue
             owner = orch.functions.taskOwner(REQ_ID, i).call()
-            if owner == ZERO:
-                continue
+            if owner == ZERO: continue
             t = orch.functions.claimedAt(REQ_ID, i).call()
-            if t == 0:
-                continue
-            remain = (t + ttl_sec) - now
+            if t == 0: continue
+            remain = (t + ttl) - now
             if remain > 0:
-                # Keep it informative but not chatty.
                 print(f"   waiting TTL for idx {i}… {remain}s")
                 continue
-
-            # Preflight reassign
             try:
                 orch.functions.reassignTimedOut(REQ_ID, i).call({"from": addr})
             except Exception:
@@ -325,7 +408,7 @@ def maybe_reassign_timeouts():
     except Exception:
         pass
 
-# Main loop
+# ───────── main loop
 while True:
     claimed_any = False
     while True:
@@ -337,23 +420,21 @@ while True:
         print(f"   claimed task {idx} (lr={lr_ppm}, steps={steps}) with bond {w3.from_wei(bond_wei,'ether')} ETH")
         try:
             do_task(int(idx), int(lr_ppm), int(steps))
-        except subprocess.CalledProcessError as e:
+        except subprocess.CalledProcessError:
             print(f"   snark/proof failed for task {idx}; it will time out and be reassignable.")
         except Exception as e:
             print(f"   task {idx} failed: {e}")
 
-    # closed?
     closed, bestAcc, winTaskCount, perWinTaskWei, perLoseTaskWei = orch.functions.getResult(REQ_ID).call()
     if closed:
         break
 
-    # Help free stale tasks only when we didn’t claim anything this pass
     if not claimed_any:
         maybe_reassign_timeouts()
 
     time.sleep(1.5)
 
-# Settlement summary
+# ───────── settlement summary
 closed, bestAcc, winTaskCount, perWinTaskWei, perLoseTaskWei = orch.functions.getResult(REQ_ID).call()
 space = orch.functions.getSpace(REQ_ID).call()
 
@@ -367,7 +448,7 @@ for i in range(len(space)):
             if acc == int(bestAcc): my_win += 1
             else:                   my_lose += 1
 
-my_credit = int(orch.functions.credit(REQ_ID, addr).call())  # direct mapping getter
+my_credit = int(orch.functions.credit(REQ_ID, addr).call())
 bond_refund = my_proven * bond_wei
 reward_expected = my_win * int(perWinTaskWei) + my_lose * int(perLoseTaskWei)
 note = "" if (bond_refund + reward_expected) == my_credit else " (incl. remainder)"
@@ -389,7 +470,6 @@ if my_credit > 0:
         if "no credit" in msg: print("   (race) no credit left at withdraw time.")
         else: print("   withdraw failed:", msg)
 
-# right after a successful withdraw (or after settlement block, regardless of withdraw outcome)
 bal1 = int(w3.eth.get_balance(addr))
 delta = bal1 - bal0
 print(f"   balance after:  {w3.from_wei(bal1,'ether')} ETH (Δ {w3.from_wei(delta,'ether')} ETH)")
