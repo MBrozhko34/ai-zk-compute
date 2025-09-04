@@ -229,7 +229,7 @@ def do_task(idx: int, lr_ppm: int, steps: int):
         [int(proof["pi_b"][1][1]), int(proof["pi_b"][1][0])]
     ]
     c = [int(proof["pi_c"][0]), int(proof["pi_c"][1])]
-    send_tx(orch.functions.submitProof(REQ_ID, a, b, c, public_signals), min_gas=1_200_000)
+    send_tx(orch.functions.submitProofOrSlash(REQ_ID, idx, a, b, c, public_signals), min_gas=1_200_000)
     print(f"   ✓ submitted proof for task {idx}")
 
 # Claim one task (preflight & parse event)

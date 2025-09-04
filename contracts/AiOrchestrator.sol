@@ -33,6 +33,7 @@ contract AiOrchestrator is ReentrancyGuard {
     uint256 public constant CLAIM_BOND_WEI = 0.005 ether;
     // Claim timeout window (enable reassignment after majority proven)
     uint256 public constant CLAIM_TTL = 10; // seconds
+    uint256 public constant STALL_TTL = 60; // seconds (choose to taste)
 
     // Winner/loser weights for per-task split
     uint256 private constant WIN_W = 3;
@@ -61,6 +62,7 @@ contract AiOrchestrator is ReentrancyGuard {
     event TaskReassigned(uint256 id, uint256 idx, address prevClaimer, uint256 slashedWei, uint256 newBountyWei);
     event ProofAccepted(uint256 id, uint256 idx, address node, uint256 acc);
     event RequestClosed(uint256 id, uint256 bestAcc, uint256 winnerTaskCount, uint256 perWinnerTaskWei, uint256 perLoserTaskWei);
+    event BadProof(uint256 id, uint256 idx, address node, uint256 slashedWei);
 
     constructor(address verifier) { V = Groth16Verifier(verifier); }
 
@@ -74,13 +76,23 @@ contract AiOrchestrator is ReentrancyGuard {
         require(msg.value > 0, "bounty=0");
         require(minWorkers > 0 && minWorkers <= grid.length, "bad minWorkers");
 
+        // Enforce uniqueness of (lr,steps) pairs
+        for (uint256 i; i < grid.length; ++i) {
+            for (uint256 j = i + 1; j < grid.length; ++j) {
+                require(
+                    !(grid[i].lr == grid[j].lr && grid[i].steps == grid[j].steps),
+                    "duplicate hp"
+                );
+            }
+        }
+
         id = nextId++;
         Request storage q = R[id];
         q.client     = msg.sender;
         q.datasetCID = cid;
         q.bountyWei  = msg.value;
         q.minWorkers = minWorkers;
-        for (uint256 i; i < grid.length; ++i) q.space.push(grid[i]);
+        for (uint256 k; k < grid.length; ++k) q.space.push(grid[k]);
 
         emit RequestOpened(id, grid.length, minWorkers, msg.value);
     }
@@ -144,20 +156,23 @@ contract AiOrchestrator is ReentrancyGuard {
         address prev = taskOwner[id][idx];
         require(prev != address(0), "not claimed");
 
-        // Fast-path: if this is the last unproven task, skip majority/TTL.
         bool lastUnproven = (_provenCount(id) == q.space.length - 1);
         if (!lastUnproven) {
-            require(_majorityProven(id), "majority not proven");
-            require(block.timestamp >= claimedAt[id][idx] + CLAIM_TTL, "not timed out");
+            uint256 t = claimedAt[id][idx];
+            // Normal path: majority proven + TTL
+            if (_majorityProven(id)) {
+                require(block.timestamp >= t + CLAIM_TTL, "not timed out");
+            } else {
+                // Stall path: allow after global stall timeout even without majority
+                require(block.timestamp >= t + STALL_TTL, "stall TTL");
+            }
         }
 
-        // Slash previous claimer's bond into bounty.
         uint256 b = taskBondWei[id][idx];
         if (b > 0) {
             q.bountyWei += b;
             taskBondWei[id][idx] = 0;
         }
-
         taskOwner[id][idx] = address(0);
         claimedAt[id][idx] = 0;
 
@@ -198,6 +213,54 @@ contract AiOrchestrator is ReentrancyGuard {
         emit ProofAccepted(id, idx, msg.sender, pubSig[2]);
 
         // if all tasks proven → compute settlement once
+        if (_allProven(id)) _computeSettlement(id);
+    }
+
+    function submitProofOrSlash(
+        uint256 id,
+        uint256 idx,
+        uint256[2] calldata a,
+        uint256[2][2] calldata b,
+        uint256[2] calldata c,
+        uint256[3] calldata pubSig   // [lr, steps, acc_bps]
+    ) external nonReentrant {
+        Request storage q = R[id];
+        require(q.started && !q.closed, "bad state");
+        require(idx < q.space.length, "bad idx");
+        require(taskOwner[id][idx] == msg.sender, "task not yours");
+
+        // Require that pubSig matches the claimed index to prevent cross-index shenanigans
+        require(
+            pubSig[0] == q.space[idx].lr && pubSig[1] == q.space[idx].steps,
+            "pubSig mismatch"
+        );
+
+        // If the proof is invalid: slash bond, free the claim, emit, and return
+        if (!V.verifyProof(a, b, c, pubSig)) {
+            uint256 bnd = taskBondWei[id][idx];
+            if (bnd > 0) {
+                q.bountyWei += bnd;
+                taskBondWei[id][idx] = 0;
+            }
+            address prev = taskOwner[id][idx];
+            taskOwner[id][idx] = address(0);
+            claimedAt[id][idx] = 0;
+            emit BadProof(id, idx, prev, bnd);
+            return;
+        }
+
+        // Valid proof ⇒ accept (same as submitProof)
+        require(taskAcc[id][idx] == 0, "already proven");
+        taskAcc[id][idx] = pubSig[2];
+
+        // refund bond
+        uint256 bndOk = taskBondWei[id][idx];
+        if (bndOk > 0) {
+            credit[id][msg.sender] += bndOk;
+            taskBondWei[id][idx] = 0;
+        }
+
+        emit ProofAccepted(id, idx, msg.sender, pubSig[2]);
         if (_allProven(id)) _computeSettlement(id);
     }
 
