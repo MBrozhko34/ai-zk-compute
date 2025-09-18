@@ -12,7 +12,7 @@ clear:
 circuit:
 	cd circuits && \
 		circom XorCircuit.circom --r1cs --wasm --sym -l ./lib && \
-		snarkjs plonk setup XorCircuit.r1cs powersOfTau28_hez_final_10.ptau xor_final.zkey && \
+		snarkjs plonk setup XorCircuit.r1cs pot18_final.ptau xor_final.zkey && \
 		snarkjs zkey export verificationkey xor_final.zkey verification_key.json && \
 		snarkjs zkey export solidityverifier xor_final.zkey ../contracts/PlonkVerifier.sol
 
