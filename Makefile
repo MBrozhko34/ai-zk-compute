@@ -9,13 +9,6 @@ clear:
 	pnpm hardhat clean
 	rm -rf circuits/XorCircuit_js circuits/*.zkey circuits/*.r1cs circuits/*.sym contracts/Groth16Verifier.sol contracts/PlonkVerifier.sol
 
-plonk-circuit:
-	cd circuits && \
-		circom XorCircuit.circom --r1cs --wasm --sym -l ./lib && \
-		snarkjs plonk setup XorCircuit.r1cs pot18_final.ptau xor_final.zkey && \
-		snarkjs zkey export verificationkey xor_final.zkey verification_key.json && \
-		snarkjs zkey export solidityverifier xor_final.zkey ../contracts/PlonkVerifier.sol
-
 groth-circuit:
 	cd circuits && \
 		circom XorCircuit.circom --r1cs --wasm --sym -l ./lib && \
