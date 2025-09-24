@@ -1,16 +1,10 @@
 #!/usr/bin/env python3
-"""
-Track B+ worker with deterministic init (by steps) and robust guards.
-Prints TRAIN vs TEST (hold-out) accuracy and performs Track-B+ flow.
-"""
-
-import json, os, subprocess, tempfile, pathlib, time
-from typing import Optional, List, Tuple, Union
+import json, os, subprocess, tempfile, pathlib, time, math
+from typing import Optional, List, Tuple
 
 from web3 import Web3, HTTPProvider
 from eth_account import Account
 from eth_account.signers.local import LocalAccount
-from hexbytes import HexBytes
 
 # ───────── env
 RPC_URL   = os.getenv("RPC_URL", "http://127.0.0.1:8545")
@@ -18,11 +12,9 @@ ORCH_ADDR = os.getenv("ORCH_ADDR")
 PRIV      = os.getenv("PRIVATE_KEY")
 REQ_ID    = int(os.getenv("REQUEST_ID", 0) or 0)
 
-DATASET_CSV = os.getenv("DATASET_CSV", "../client/dataset.csv")
+TRAIN_CSV = os.getenv("TRAIN_CSV",   "../client/train.csv")
+HOLD_CSV  = os.getenv("HOLDOUT_CSV", "../client/dataset.csv")
 
-ZKEY      = pathlib.Path("../circuits/xor_final.zkey")
-VK_JSON   = pathlib.Path("../circuits/verification_key.json")
-CIRC_DIR  = pathlib.Path("../circuits/XorCircuit_js")
 ABI_PATH  = pathlib.Path("../artifacts/contracts/AiOrchestrator.sol/AiOrchestrator.json")
 assert ORCH_ADDR and PRIV, "ORCH_ADDR & PRIVATE_KEY required"
 
@@ -33,165 +25,168 @@ orch = w3.eth.contract(address=w3.to_checksum_address(ORCH_ADDR),
                        abi=json.load(open(ABI_PATH))["abi"])
 addr = acct.address
 
-# ───────── utilities
+# ───────── integer model constants (must match contract)
+CAP = 15
+TH  = 8
 
-def is_zero_bytes32(v: Union[bytes, HexBytes, str, int]) -> bool:
-    if isinstance(v, int):
-        return v == 0
-    if isinstance(v, (bytes, bytearray, HexBytes)):
-        return int.from_bytes(bytes(v), "big") == 0
-    if isinstance(v, str):
-        s = v.strip().lower()
-        if s.startswith("0x"): s = s[2:]
-        if s == "": return True
-        return int(s, 16) == 0
-    # unknown type — be conservative
-    return False
+def quant01_to_q3(v) -> int:
+    f = float(v)
+    if math.isnan(f) or math.isinf(f):
+        raise ValueError(f"bad number {v}")
+    q = int(round(max(0.0, min(1.0, f)) * 3.0))
+    return max(0, min(3, q))
 
-# robust Groth16 calldata parser (unchanged)
-def parse_groth16_calldata(raw: str):
-    txt = raw.strip()
-    def _try(s):
-        try: return json.loads(s)
-        except: return None
-    parsed = _try(txt) or _try(f"[{txt}]")
-    if parsed is None: raise RuntimeError("cannot parse groth16 calldata")
-    if isinstance(parsed, list) and len(parsed) == 4 and all(isinstance(x, list) for x in parsed):
-        a_raw, b_raw, c_raw, inputs_raw = parsed
-    elif isinstance(parsed, list) and len(parsed) == 1 and isinstance(parsed[0], list) and len(parsed[0]) == 4:
-        a_raw, b_raw, c_raw, inputs_raw = parsed[0]
-    else:
-        raise RuntimeError("unexpected groth16 calldata shape")
+def load_csv2(path: str):
+    xs0: List[int] = []
+    xs1: List[int] = []
+    ys:  List[int] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for i, raw in enumerate(f.read().splitlines()):
+            if not raw: continue
+            line = raw.strip()
+            if not line or line.startswith("#"): continue
+            cells = [c for c in re_split(line) if c]
+            if len(cells) < 3: continue
+            if i == 0 and not cells[0].replace(".","",1).isdigit():  # header heuristic
+                continue
+            x0 = quant01_to_q3(cells[0])
+            x1 = quant01_to_q3(cells[1])
+            y  = int(cells[2])
+            if y not in (0,1): raise ValueError(f"y must be 0/1 at row {i+1}")
+            xs0.append(x0); xs1.append(x1); ys.append(y)
+    if not xs0: raise RuntimeError(f"empty/invalid csv {path}")
+    return xs0, xs1, ys
 
-    def _to_int(x):
-        if isinstance(x, int): return x
-        if isinstance(x, str):
-            s = x.strip()
-            return int(s, 16) if s.lower().startswith("0x") else int(s)
-        raise TypeError(f"bad numeric {type(x)}")
-    a = [_to_int(x) for x in a_raw]
-    b = [[_to_int(x) for x in row] for row in b_raw]
-    c = [_to_int(x) for x in c_raw]
-    inputs = [_to_int(x) for x in inputs_raw]
-    if len(a)!=2 or len(c)!=2 or len(b)!=2 or any(len(row)!=2 for row in b):
-        raise RuntimeError("bad (a,b,c) shapes")
-    return a, b, c, inputs
+def re_split(s: str):
+    # split on comma / semicolon / whitespace
+    import re
+    return re.split(r"[,;\s]+", s.strip())
 
-# training dynamics (unchanged)
-def step1(v: int) -> int: return 1 if v >= 1 else 0     # Hidden-0 gate
-def step2(v: int) -> int: return 1 if v >= 2 else 0     # Hidden-1 gate
-def lr_bucket(lr_ppm: int) -> int: return 1 + (1 if lr_ppm >= 50_000 else 0) + (1 if lr_ppm >= 100_000 else 0)
-def sat_add3_floor(x: int, inc: int, dec: int, delta: int, floor: int = 0) -> int:
-    x_cap = x + inc * delta
-    if x_cap > 3: x_cap = 3
-    sub = dec * delta
-    if x_cap - sub < floor: return floor
-    return x_cap - sub
+# ───────── robust Merkle (sorted-pair)
+def h256(b: bytes) -> bytes:
+    return Web3.keccak(b)
 
-def seeded_init(lr_ppm: int, steps: int) -> Tuple[int,int,int,int,int,int,int]:
-    # steps >= 60: good XOR init (bO=0). else: bO=1 (degenerate).
-    w0=w1=w2=w3=1; b0=0; b1=0; bO=(0 if steps >= 60 else 1)
-    return (w0,w1,w2,w3,b0,b1,bO)
+def bytes32_of_int(x: int) -> bytes:
+    return x.to_bytes(32, byteorder="big", signed=False)
 
-def train_collect(lr_ppm: int, steps: int, max_epochs: int = 300):
-    w0,w1,w2,w3,b0,b1,bO = seeded_init(lr_ppm, steps)
-    X = [(0,0),(1,0),(0,1),(1,1)]; Y = [0,1,1,0]
-    L = lr_bucket(lr_ppm)
-    T = min(int(steps), max_epochs)
-    pairs: List[Tuple[Tuple[int,...], Tuple[int,...]]] = []
-    for _e in range(T):
-        for (x0,x1), y in zip(X, Y):
-            ws = (w0,w1,w2,w3,b0,b1,bO)
-            s0 = step1(w0*x0 + w1*x1 + b0)
-            s1 = step2(w2*x0 + w3*x1 + b1)
-            o  = 1 if (s0 - s1 + bO) >= 1 else 0
-            pos = (1 - o) * y
-            neg = (1 - y) * o
-            d0 = L * x0; d1 = L * x1
-            w0 = sat_add3_floor(w0, pos, neg, d0, 0)
-            w1 = sat_add3_floor(w1, pos, neg, d1, 0)
-            b0 = sat_add3_floor(b0, pos, neg, L,  0)
-            w2 = sat_add3_floor(w2, neg, pos, d0, 0)
-            w3 = sat_add3_floor(w3, neg, pos, d1, 0)
-            b1 = sat_add3_floor(b1, neg, pos, L,  0)
-            bO = sat_add3_floor(bO, pos, neg, L,  0)
-            we = (w0,w1,w2,w3,b0,b1,bO)
-            pairs.append((ws, we))
-    correct=0
-    for (x0,x1), y in zip(X, Y):
-        s0 = step1(w0*x0 + w1*x1 + b0)
-        s1 = step2(w2*x0 + w3*x1 + b1)
-        o  = 1 if (s0 - s1 + bO) >= 1 else 0
-        correct += int(o == y)
-    acc_bps = correct * 2500
-    finalW  = (w0,w1,w2,w3,b0,b1,bO)
-    return acc_bps, finalW, pairs
+def hash_pair_sorted(a: bytes, b: bytes) -> bytes:
+    return h256(a + b) if a < b else h256(b + a)
 
-# local hold-out reading (for printing only)
-def load_holdout_csv(path: str) -> List[Tuple[int,int,int]]:
-    rows: List[Tuple[int,int,int]] = []
-    try:
-        with open(path, "r") as f:
-            for i, raw in enumerate(f.read().splitlines()):
-                line = (raw or "").strip()
-                if not line or line.startswith("#"): continue
-                parts = [c for c in line.replace(",", " ").replace(";", " ").split() if c]
-                if len(parts) < 3: continue
-                if i == 0 and (not parts[0].isdigit() or not parts[1].isdigit() or not parts[2].isdigit()):
-                    continue
-                a,b,c = int(parts[0]), int(parts[1]), int(parts[2])
-                if a in (0,1) and b in (0,1) and c in (0,1):
-                    rows.append((a,b,c))
-    except Exception:
-        rows = [(0,0,0),(1,0,1),(0,1,1),(1,1,0)]
-    if not rows:
-        rows = [(0,0,0),(1,0,1),(0,1,1),(1,1,0)]
-    return rows
-
-def acc_on(weights: Tuple[int,...], rows: List[Tuple[int,int,int]]) -> float:
-    w0,w1,w2,w3,b0,b1,bO = weights
-    correct = 0
-    for (x0,x1,y) in rows:
-        s0 = step1(w0*x0 + w1*x1 + b0)
-        s1 = step2(w2*x0 + w3*x1 + b1)
-        o  = 1 if (s0 - s1 + bO) >= 1 else 0
-        correct += int(o == y)
-    return (100.0 * correct) / max(1, len(rows))
-
-# Merkle helpers (unchanged)
-def h256(b: bytes) -> bytes: return Web3.keccak(b)
-def bytes32_of_int(x: int) -> bytes: return x.to_bytes(32, "big", signed=False)
-def hashW7(W: Tuple[int,...]) -> bytes: return h256(b"".join(bytes32_of_int(v) for v in W))
-def leaf_for_step(step_idx: int, ws: Tuple[int,...], we: Tuple[int,...]) -> bytes:
-    return h256(bytes32_of_int(step_idx) + hashW7(ws) + hashW7(we))
-def hash_pair_sorted(a: bytes, b: bytes) -> bytes: return h256(a + b) if a < b else h256(b + a)
-def build_merkle_root(leaves: List[bytes]) -> bytes:
+def build_merkle_root_sorted(leaves: List[bytes]) -> bytes:
+    if not leaves:
+        return b"\x00"*32
     level = leaves[:]
-    if not level: return b"\x00"*32
     while len(level) > 1:
         nxt: List[bytes] = []
         for i in range(0, len(level), 2):
-            if i+1 < len(level): nxt.append(hash_pair_sorted(level[i], level[i+1]))
-            else:                 nxt.append(hash_pair_sorted(level[i], level[i]))
+            if i+1 < len(level):
+                nxt.append(hash_pair_sorted(level[i], level[i+1]))
+            else:
+                nxt.append(hash_pair_sorted(level[i], level[i]))
         level = nxt
     return level[0]
-def merkle_proof_sorted(leaves: List[bytes], index: int) -> List[bytes]:
+
+def build_merkle_layers_sorted(leaves: List[bytes]) -> List[List[bytes]]:
     layers = [leaves[:]]
     while len(layers[-1]) > 1:
-        cur = layers[-1]; nxt=[]
+        cur = layers[-1]
+        nxt = []
         for i in range(0, len(cur), 2):
             if i+1 < len(cur): nxt.append(hash_pair_sorted(cur[i], cur[i+1]))
             else:              nxt.append(hash_pair_sorted(cur[i], cur[i]))
         layers.append(nxt)
+    return layers
+
+def merkle_proof_sorted(layers: List[List[bytes]], index: int) -> List[bytes]:
     path: List[bytes] = []
     idx = index
     for h in range(len(layers) - 1):
-        cur = layers[h]; sib = idx ^ 1
-        path.append(cur[sib] if sib < len(cur) else cur[idx])
+        cur = layers[h]
+        sib = idx ^ 1
+        if sib < len(cur): path.append(cur[sib])
+        else:              path.append(cur[idx])
         idx //= 2
     return path
 
-# tx utils (unchanged)
+# transcript leaf: keccak(stepIndex, H(Ws), H(We))
+def hashW7(W: Tuple[int,...]) -> bytes:
+    assert len(W) == 7
+    return h256(b"".join(bytes32_of_int(v) for v in W))
+
+def leaf_for_step(step_idx: int, ws: Tuple[int,...], we: Tuple[int,...]) -> bytes:
+    return h256(bytes32_of_int(step_idx) + hashW7(ws) + hashW7(we))
+
+# training-sample leaf: keccak(index, x0, x1, y)
+def leaf_for_sample(idx: int, x0: int, x1: int, y: int) -> bytes:
+    return h256(b"".join([
+        bytes32_of_int(idx), bytes32_of_int(x0), bytes32_of_int(x1), bytes32_of_int(y)
+    ]))
+
+# ───────── integer model: bucket, step, sat update
+def lr_bucket(lr_ppm: int) -> int:
+    return 1 + (1 if lr_ppm >= 50_000 else 0) + (1 if lr_ppm >= 100_000 else 0)
+
+def ge(v: int, thr: int) -> int:
+    return 1 if v >= thr else 0
+
+def sat_update(x: int, inc: int, dec: int, delta: int, floor: int = 0) -> int:
+    xcap = x + inc * delta
+    if xcap > CAP: xcap = CAP
+    sub = dec * delta
+    if xcap - sub < floor: return floor
+    return xcap - sub
+
+def apply_one_step(W: Tuple[int,...], x0: int, x1: int, y: int, L: int) -> Tuple[int,...]:
+    w0,w1,w2,w3,b0,b1,bO = W
+    s0 = ge(w0 * x0 + w1 * x1 + b0, TH)
+    s1 = ge(w2 * x0 + w3 * x1 + b1, TH)
+    o  = 1 if (int(s0) - int(s1) + int(bO)) >= 1 else 0
+
+    pos = (1 - o) * y
+    neg = (1 - y) * o
+
+    d0 = L * x0
+    d1 = L * x1
+
+    w0 = sat_update(w0, pos, neg, d0, 0)
+    w1 = sat_update(w1, pos, neg, d1, 0)
+    b0 = sat_update(b0, pos, neg, L,  0)
+
+    w2 = sat_update(w2, neg, pos, d0, 0)
+    w3 = sat_update(w3, neg, pos, d1, 0)
+    b1 = sat_update(b1, neg, pos, L,  0)
+
+    bO = sat_update(bO, pos, neg, L,  0)
+    return (w0,w1,w2,w3,b0,b1,bO)
+
+def train_collect(xs0: List[int], xs1: List[int], ys: List[int], lr_ppm: int, steps: int):
+    assert len(xs0) == len(xs1) == len(ys)
+    N = len(xs0)
+    L = lr_bucket(lr_ppm)
+    T = int(steps)
+
+    # init weights
+    W = (1,1,1,1, 0,0, 0)  # bO starts at 0 now
+
+    pairs: List[Tuple[Tuple[int,...], Tuple[int,...]]] = []
+    for e in range(T):
+        for j in range(N):
+            ws = W
+            W  = apply_one_step(W, xs0[j], xs1[j], ys[j], L)
+            pairs.append((ws, W))
+    return W, pairs, N, T
+
+def accuracy_on(W: Tuple[int,...], xs0: List[int], xs1: List[int], ys: List[int]) -> float:
+    w0,w1,w2,w3,b0,b1,bO = W
+    correct = 0
+    for x0,x1,y in zip(xs0, xs1, ys):
+        s0 = ge(w0 * x0 + w1 * x1 + b0, TH)
+        s1 = ge(w2 * x0 + w3 * x1 + b1, TH)
+        o  = 1 if (int(s0) - int(s1) + int(bO)) >= 1 else 0
+        correct += int(o == y)
+    return correct / len(xs0)
+
+# ───────── tx helpers
 def _decode_error_string(data_hex: str):
     try:
         if not data_hex or not data_hex.startswith("0x"): return None
@@ -231,6 +226,7 @@ def send_tx(fn_call, *, value: int = 0, min_gas: int = 220_000, headroom_num: in
     except Exception as e:
         print("   gas estimation failed, defaulting:", explain_web3_error(e))
         gas_limit = max(min_gas, 3_000_000)
+
     n_retries = 0
     while True:
         try:
@@ -254,44 +250,35 @@ def send_tx(fn_call, *, value: int = 0, min_gas: int = 220_000, headroom_num: in
                 raise RuntimeError(f"OOG — try higher gas. Details: {msg}") from e
             raise RuntimeError(msg) from e
 
+# ───────── event topics (optional utils)
 TOPIC_ONCHAIN_ACC = w3.keccak(text="OnChainAccChecked(uint256,uint256,uint256,uint256,uint256)").hex()
 TOPIC_FINALIZED   = w3.keccak(text="ChallengesFinalized(uint256,uint256,bytes32,uint256)").hex()
 TOPIC_ACCEPTED    = w3.keccak(text="ProofAccepted(uint256,uint256,address,uint256)").hex()
-TOPIC_BAD         = w3.keccak(text="BadProof(uint256,uint256,address,uint256)").hex()
 
-def print_onchain_acc(rcpt):
-    for log in rcpt.logs:
-        if log["address"].lower() != ORCH_ADDR.lower(): continue
-        if log["topics"][0].hex().lower() == TOPIC_ONCHAIN_ACC.lower():
-            ev = orch.events.OnChainAccChecked().process_log(log)
-            args = ev["args"]
-            print(f"   on-chain inference: claimed {int(args['claimedAccBps'])/100:.2f}% "
-                  f"vs recomputed {int(args['accOnChain'])/100:.2f}% on {int(args['rows'])} rows")
-
-def print_accept_or_slash(rcpt, idx: int):
-    accepted = False
-    for log in rcpt.logs:
-        if log["address"].lower() != ORCH_ADDR.lower(): continue
-        t0 = log["topics"][0].hex().lower()
-        if t0 == TOPIC_ACCEPTED.lower(): accepted = True
-        if t0 == TOPIC_BAD.lower():      accepted = False
-    if accepted: print(f"   ✓ accepted on-chain (task {idx})")
-    else:        print(f"   ✗ rejected/slashed on-chain (task {idx})")
-
-# helpers
 def chain_now() -> int:
     return int(w3.eth.get_block("latest")["timestamp"])
+
 def space_len() -> int:
     return len(orch.functions.getSpace(REQ_ID).call())
+
 def count_proven(n: int) -> int:
     return sum(1 for i in range(n) if orch.functions.taskAcc(REQ_ID, i).call() != 0)
-def answered_mask(idx: int) -> int:
-    return int(orch.functions.answeredMask(REQ_ID, idx).call())
+
+def ensure_owner(idx: int) -> bool:
+    return orch.functions.taskOwner(REQ_ID, idx).call().lower() == addr.lower()
 
 # ───────── main
-bal0 = int(w3.eth.get_balance(addr))
 print(f"[worker:{addr}] starting on request {REQ_ID}…")
+bal0 = int(w3.eth.get_balance(addr))
 print(f"   balance before: {w3.from_wei(bal0,'ether')} ETH")
+
+import re as _re
+def _is_header_line(line: str) -> bool:
+    return bool(_re.search(r"[A-Za-z]", line))
+
+# Load data
+tr_x0, tr_x1, tr_y = load_csv2(TRAIN_CSV)
+te_x0, te_x1, te_y = load_csv2(HOLD_CSV)
 
 # join / wait
 try:
@@ -339,24 +326,26 @@ def try_claim_one() -> Optional[int]:
         orch.functions.claimTask(REQ_ID).call({"from": addr, "value": bond_wei})
     except Exception as e:
         msg = explain_web3_error(e)
-        if any(x in msg for x in ["no tasks left", "closed", "not started", "bond", "holdout not set"]):
+        if any(x in msg for x in ["no tasks left", "closed", "not started", "bond", "holdout not set", "train root not set"]):
             return None
         print("   claimTask preflight failed:", msg); return None
 
     rcpt = send_tx(orch.functions.claimTask(REQ_ID), value=bond_wei, min_gas=230_000)
     evs = orch.events.TaskClaimed().process_receipt(rcpt)
     if evs: return int(evs[-1]["args"]["idx"])
+    # fallback scan
     n = space_len()
     for i in range(n):
         owner = orch.functions.taskOwner(REQ_ID, i).call()
         acc   = orch.functions.taskAcc(REQ_ID, i).call()
-        if owner == addr and acc == 0:
+        if owner.lower() == addr.lower() and acc == 0:
             return i
     return None
 
 ZERO = "0x0000000000000000000000000000000000000000"
 
 def maybe_reassign_timeouts():
+    # Do NOT reassign tasks that we own (prevents self-sabotage / "task not yours")
     try:
         n = space_len()
         proven = count_proven(n)
@@ -364,15 +353,14 @@ def maybe_reassign_timeouts():
         majority = (proven * 2) > n
         ttl = claim_ttl if majority else stall_ttl
 
-        # If only one remains, do NOT reassign if we own it.
         if proven == n - 1:
             for i in range(n):
+                if orch.functions.taskOwner(REQ_ID, i).call().lower() == addr.lower():  # skip mine
+                    continue
                 acc = orch.functions.taskAcc(REQ_ID, i).call()
-                if acc != 0:
-                    continue
+                if acc != 0: continue
                 owner = orch.functions.taskOwner(REQ_ID, i).call()
-                if owner == ZERO or owner.lower() == addr.lower():   # <-- skip our own
-                    continue
+                if owner == ZERO: continue
                 try:
                     orch.functions.reassignTimedOut(REQ_ID, i).call({"from": addr})
                 except Exception:
@@ -385,19 +373,18 @@ def maybe_reassign_timeouts():
                         pass
             return
 
-        # General case: still never reassign our own task; respect TTL.
         for i in range(n):
+            if orch.functions.taskOwner(REQ_ID, i).call().lower() == addr.lower():  # skip mine
+                continue
             acc = orch.functions.taskAcc(REQ_ID, i).call()
             if acc != 0: continue
             owner = orch.functions.taskOwner(REQ_ID, i).call()
-            if owner == ZERO or owner.lower() == addr.lower():       # <-- skip our own
-                continue
+            if owner == ZERO: continue
             t = orch.functions.claimedAt(REQ_ID, i).call()
             if t == 0: continue
             remain = (t + ttl) - now
             if remain > 0:
-                # Optional: print only occasionally to reduce spam
-                # print(f"   waiting TTL for idx {i}… {remain}s")
+                print(f"   waiting TTL for idx {i}… {remain}s")
                 continue
             try:
                 orch.functions.reassignTimedOut(REQ_ID, i).call({"from": addr})
@@ -411,142 +398,139 @@ def maybe_reassign_timeouts():
     except Exception:
         pass
 
+# Build training-sample Merkle (once)
+samp_leaves = [leaf_for_sample(i, tr_x0[i], tr_x1[i], tr_y[i]) for i in range(len(tr_x0))]
+samp_layers = build_merkle_layers_sorted(samp_leaves)
+samp_root   = build_merkle_root_sorted(samp_leaves)
 
+# ───────── do one task end-to-end
 def do_task(idx: int, lr_ppm: int, steps: int):
-    owner = orch.functions.taskOwner(REQ_ID, idx).call()
-    if owner.lower() != addr.lower():
-        print(f"   [task {idx}] not mine anymore; skipping.")
-        return
-    if int(orch.functions.taskAcc(REQ_ID, idx).call()) != 0:
-        print(f"   [task {idx}] already proven; skipping.")
-        return
+    # TRAIN
+    finalW, pairs, N, T = train_collect(tr_x0, tr_x1, tr_y, lr_ppm, steps)
+    train_acc = accuracy_on(finalW, tr_x0, tr_x1, tr_y)
+    test_acc  = accuracy_on(finalW, te_x0, te_x1, te_y)
+    print(f"   [task {idx}] trained {T} epochs (bucket={lr_bucket(lr_ppm)}) → "
+          f"train acc {100*train_acc:.2f}% | test acc {100*test_acc:.2f}%")
 
-    # 1) Train with transcript
-    acc_bps, finalW, pairs = train_collect(lr_ppm, steps)
-    train_acc_pct = acc_bps / 100.0
-    hold = load_holdout_csv(DATASET_CSV)
-    test_acc_pct = acc_on(finalW, hold)
-    print(f"   [task {idx}] trained {min(steps,300)} epochs (bucket={lr_bucket(lr_ppm)})"
-          f" → train acc {train_acc_pct:.2f}% | test acc {test_acc_pct:.2f}%")
-
-    # 2) Build transcript Merkle (sorted)
+    # TRANSCRIPT
     leaves = [leaf_for_step(i, ws, we) for i, (ws,we) in enumerate(pairs)]
-    root   = build_merkle_root(leaves)
-    total  = len(leaves)
-    print(f"   committed transcript root={Web3.to_hex(root)} totalSteps={total}")
+    tr_layers = build_merkle_layers_sorted(leaves)
+    tr_root   = build_merkle_root_sorted(leaves)
+    total     = len(leaves)
+    print(f"   committed transcript root={Web3.to_hex(tr_root)} totalSteps={total}")
 
-    # 2a) commit transcript if not already done
+    if not ensure_owner(idx): 
+        print("   lost ownership before commit; aborting task.")
+        return
+
+    # 2a) commit transcript
     try:
-        current_root = orch.functions.trRoot(REQ_ID, idx).call()
-        if is_zero_bytes32(current_root):
-            send_tx(orch.functions.commitTranscript(REQ_ID, idx, root, total), min_gas=200_000)
+        # preflight
+        current = orch.functions.trRoot(REQ_ID, idx).call()
+        if int(current,16) == 0:
+            send_tx(orch.functions.commitTranscript(REQ_ID, idx, Web3.to_hex(tr_root), total), min_gas=200_000)
         else:
             print("   transcript already committed on-chain.")
     except Exception as e:
         msg = explain_web3_error(e)
-        if "already committed" not in msg and "task not yours" not in msg:
+        if "already committed" in msg:
+            print("   transcript already committed on-chain.")
+        else:
             raise
 
-    # 2b) finalize challenges (K=3) if not already done
+    if not ensure_owner(idx): 
+        print("   lost ownership before finalize; aborting task.")
+        return
+
+    # 2b) finalize K
+    K = 3
     try:
-        Kcur = int(orch.functions.challengeK(REQ_ID, idx).call())
-        if Kcur == 0:
-            rcpt = send_tx(orch.functions.finalizeChallenges(REQ_ID, idx, 3), min_gas=200_000)
+        k_cur = orch.functions.challengeK(REQ_ID, idx).call()
+        if int(k_cur) == 0:
+            rcpt = send_tx(orch.functions.finalizeChallenges(REQ_ID, idx, K), min_gas=200_000)
             for log in rcpt.logs:
                 if log["address"].lower() != ORCH_ADDR.lower(): continue
                 if log["topics"][0].hex().lower() == TOPIC_FINALIZED.lower():
                     ev = orch.events.ChallengesFinalized().process_log(log)
                     sd = ev["args"]["seed"]
-                    print(f"   finalized seed={Web3.to_hex(sd)}  challengeK=3")
-            Kcur = 3
+                    print(f"   finalized seed={Web3.to_hex(sd)}  challengeK={K}")
         else:
-            print(f"   challenges already finalized, K={Kcur}")
+            print(f"   challenges already finalized, K={int(k_cur)}")
+            K = int(k_cur)
     except Exception as e:
-        msg = explain_web3_error(e)
-        if "already finalized" not in msg and "task not yours" not in msg:
-            raise
-        Kcur = int(orch.functions.challengeK(REQ_ID, idx).call())
+        print("   finalizeChallenges failed:", explain_web3_error(e)); return
 
-    # 2c) answer challenges that remain
-    for i in range(Kcur):
-        if (answered_mask(idx) >> i) & 1:
-            continue
+    # 2c) answer each challenge
+    for i in range(K):
+        if not ensure_owner(idx): 
+            print("   lost ownership mid-challenges; aborting task.")
+            return
         step_idx = int(orch.functions.getChallenge(REQ_ID, idx, i).call())
         ws, we = pairs[step_idx]
-        proof_nodes = merkle_proof_sorted(leaves, step_idx)
-        proof_hexes = [Web3.to_hex(p) for p in proof_nodes]
-        send_tx(orch.functions.bindFinalWeights(REQ_ID, idx, i, list(ws), list(we), proof_hexes), min_gas=350_000)
-        print(f"   ✓ answered challenge i={i} (step={step_idx})")
+        # training sample index & proof for this step
+        samp_idx = step_idx % N
+        proof_samp_nodes = merkle_proof_sorted(samp_layers, samp_idx)
+        proof_samp_hexes = [Web3.to_hex(p) for p in proof_samp_nodes]
+        # transcript proof
+        proof_tr_nodes = merkle_proof_sorted(tr_layers, step_idx)
+        proof_tr_hexes = [Web3.to_hex(p) for p in proof_tr_nodes]
 
-    # 3) SNARK witness
+        try:
+            send_tx(
+                orch.functions.bindFinalWeights(
+                    REQ_ID, idx,
+                    i,
+                    list(ws), list(we),
+                    samp_idx, tr_x0[samp_idx], tr_x1[samp_idx], tr_y[samp_idx],
+                    proof_tr_hexes, proof_samp_hexes
+                ),
+                min_gas=400_000
+            )
+            print(f"   ✓ answered challenge i={i} (step={step_idx} using sample {samp_idx})")
+        except Exception as e:
+            print(f"   bindFinalWeights failed at i={i}:", explain_web3_error(e))
+            return
+
+    if not ensure_owner(idx):
+        print("   lost ownership before submit; aborting task.")
+        return
+
+    # 3) submit result (hold-out accuracy rechecked on-chain)
     w0,w1,w2,w3,b0,b1,bO = finalW
-    with tempfile.TemporaryDirectory() as td:
-        tmp = pathlib.Path(td)
-        (tmp/"input.json").write_text(json.dumps({
-            "lr": lr_ppm, "steps": steps, "acc_bps": acc_bps,
-            "w0_pub": w0, "w1_pub": w1, "w2_pub": w2, "w3_pub": w3,
-            "b0_pub": b0, "b1_pub": b1, "bO_pub": bO
-        }, indent=2))
+    acc_bps = int(round(10000.0 * test_acc))
+    rcpt = send_tx(orch.functions.submitResult(REQ_ID, idx, [w0,w1,w2,w3,b0,b1,bO], acc_bps), min_gas=250_000)
+    # parse OnChainAccChecked
+    for log in rcpt.logs:
+        if log["address"].lower() != ORCH_ADDR.lower(): continue
+        if log["topics"][0].hex().lower() == TOPIC_ONCHAIN_ACC.lower():
+            ev = orch.events.OnChainAccChecked().process_log(log)
+            args = ev["args"]
+            print(f"   on-chain test: claimed {int(args['claimedAccBps'])/100:.2f}% "
+                  f"vs recomputed {int(args['accOnChain'])/100:.2f}% on {int(args['rows'])} rows")
+    # accepted?
+    accepted = any(log["topics"][0].hex().lower() == TOPIC_ACCEPTED.lower()
+                   for log in rcpt.logs if log["address"].lower() == ORCH_ADDR.lower())
+    if accepted:
+        print(f"   ✓ accepted on-chain (task {idx})")
+    else:
+        print(f"   ✗ not accepted (task {idx})")
 
-        subprocess.check_call([
-            "node", str(CIRC_DIR/"generate_witness.js"),
-            str(CIRC_DIR/"XorCircuit.wasm"),
-            str(tmp/"input.json"), str(tmp/"witness.wtns")
-        ])
-        subprocess.check_call([
-            "snarkjs", "groth16", "prove",
-            str(ZKEY), str(tmp/"witness.wtns"),
-            str(tmp/"proof.json"), str(tmp/"public.json")
-        ])
-        print("   verifying off-chain (groth16)…")
-        subprocess.check_call([
-            "snarkjs", "groth16", "verify",
-            str(VK_JSON), str(tmp/"public.json"), str(tmp/"proof.json")
-        ])
-        print("   ✓ off-chain verification OK")
-
-        raw = subprocess.check_output([
-            "snarkjs", "zkey", "export", "soliditycalldata",
-            str(tmp/"public.json"), str(tmp/"proof.json")
-        ]).decode()
-
-    a, b, c, inputs = parse_groth16_calldata(raw)
-    if len(inputs) != 10:
-        raise RuntimeError("expected 10 public inputs")
-
-    owner_now = orch.functions.taskOwner(REQ_ID, idx).call()
-    if owner_now.lower() != addr.lower():
-        print(f"   [task {idx}] lost ownership before submit; aborting.")
-        return
-    if not orch.functions.trainingChecksPassed(REQ_ID, idx).call():
-        print(f"   [task {idx}] training checks incomplete on-chain; aborting.")
-        return
-
-    rcpt = send_tx(orch.functions.submitProofOrSlash(REQ_ID, idx, a, b, c, inputs), min_gas=700_000)
-    print("   ✓ SNARK submitted; contract rechecked accuracy")
-    print_onchain_acc(rcpt)
-    print_accept_or_slash(rcpt, idx)
-
-# ───────── main loop over tasks
+# ───────── main loop
 while True:
     claimed_any = False
     while True:
         idx = try_claim_one()
-        if idx is None:
-            break
+        if idx is None: break
         claimed_any = True
         lr_ppm, steps = orch.functions.getSpace(REQ_ID).call()[idx]
         print(f"   claimed task {idx} (lr={lr_ppm}, steps={steps}) with bond {w3.from_wei(bond_wei,'ether')} ETH")
         try:
             do_task(int(idx), int(lr_ppm), int(steps))
-        except subprocess.CalledProcessError:
-            print(f"   snark/proof failed for task {idx}; it will time out and be reassignable.")
         except Exception as e:
-            print(f"   task {idx} failed: {e}")
+            print(f"   task {idx} failed:", e)
 
     closed, bestAcc, winTaskCount, perWinTaskWei, perLoseTaskWei = orch.functions.getResult(REQ_ID).call()
-    if closed:
-        break
+    if closed: break
     if not claimed_any:
         maybe_reassign_timeouts()
     time.sleep(1.0)
