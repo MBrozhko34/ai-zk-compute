@@ -45,3 +45,15 @@ worker:
 	cd node && \
 		RPC_URL="$(RPC_URL)" ORCH_ADDR="$(ORCH_ADDR)" REQUEST_ID="$(REQUEST_ID)" PRIVATE_KEY="$(PRIVATE_KEY)" \
 		.venv/bin/python compute_node.py
+
+.PHONY: workerp
+workerp:
+	@[ -n "$(RPC_URL)" ] || (echo "RPC_URL missing (set in .env or pass inline)"; exit 1)
+	@[ -n "$(ORCH_ADDR)" ] || (echo "ORCH_ADDR missing (set in .env or pass inline)"; exit 1)
+	@[ -n "$(REQUEST_ID)" ] || (echo "REQUEST_ID missing (pass e.g. REQUEST_ID=0)"; exit 1)
+	@[ -n "$(PRIVATE_KEY)" ] || (echo "Usage: make worker PRIVATE_KEY=<hex> [REQUEST_ID=N]"; exit 1)
+	@[ -x "node/.venv/bin/python" ] || (echo "Python venv missing. Run 'make deps' first."; exit 1)
+	@[ -f "artifacts/contracts/AiOrchestrator.sol/AiOrchestrator.json" ] || pnpm hardhat compile
+	cd node && \
+		RPC_URL="$(RPC_URL)" ORCH_ADDR="$(ORCH_ADDR)" REQUEST_ID="$(REQUEST_ID)" PRIVATE_KEY="$(PRIVATE_KEY)" \
+		.venv/bin/python compute_node.py
