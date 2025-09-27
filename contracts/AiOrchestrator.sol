@@ -38,8 +38,8 @@ contract AiOrchestrator is ReentrancyGuard {
 
     /*──────── Orchestrator economics & bookkeeping ────────*/
     uint256 public constant CLAIM_BOND_WEI = 0.005 ether;
-    uint256 public constant CLAIM_TTL      = 120;
-    uint256 public constant STALL_TTL      = 600;
+    uint256 public constant CLAIM_TTL      = 300;
+    uint256 public constant STALL_TTL      = 900;
     uint256 private constant WIN_W = 3;
     uint256 private constant LOS_W = 1;
 
@@ -353,7 +353,13 @@ contract AiOrchestrator is ReentrancyGuard {
         return x;
     }
     function _lrBucket(uint256 lr) internal pure returns (uint256 L) {
-        L = 1; if (lr >= 50_000) L += 1; if (lr >= 100_000) L += 1;
+        // 8 buckets, about every 20k ppm
+        // L = clamp(1 + lr / 20_000, 1..8)
+        unchecked {
+            L = 1 + (lr / 20_000);
+            if (L < 1)  L = 1;
+            if (L > 8)  L = 8;
+        }
     }
 
     /*──────── Canonical one-step update for the 2→4→1 MLP ────────*/
