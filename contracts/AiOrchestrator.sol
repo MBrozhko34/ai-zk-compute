@@ -5,16 +5,18 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /**
  * Track B+ integrity with a real 2-layer neural model (integer MLP):
- *   - Architecture: 2 -> 4 -> 1 with ReLU gate at hidden and sign at output
+ *   - Architecture: 2 -> 4 -> 1 with ReLU-like gate at hidden and sign at output
  *   - Params: int16-like in [-127, +127], stored as int256 on-chain
  *   - Inputs: x0,x1 ∈ {0..15}, y ∈ {0,1}
- *   - Deterministic integer SGD-like update (documented in comments).
+ *   - Deterministic integer SGD-like update (documented below).
  *
- * R0: client commits Merkle root of training set (indexed leaves keccak(i,x0,x1,y)) and uploads hold-out set.
+ * R0: client commits Merkle root of training set (indexed leaves keccak(i,x0,x1,y))
+ *     and uploads hold-out either (A) as arrays (legacy) or (B) as Merkle root + length.
  * R1: hyper-params fixed by request.grid.
  * R2: worker commits Merkle root of training transcript and answers K random step checks.
- *     Each check re-runs exactly one canonical update with the verified sample.
- * R3: the hold-out accuracy is recomputed on-chain from the submitted final weights.
+ * R3: hold-out accuracy is proved:
+ *     - legacy array path: recompute full accuracy on-chain
+ *     - root path: verify K deterministic hold-out samples via Merkle proofs (gas-scalable)
  */
 
 contract AiOrchestrator is ReentrancyGuard {
@@ -31,10 +33,13 @@ contract AiOrchestrator is ReentrancyGuard {
     //  b2: [16]
     uint256 private constant W_SIZE = 17;
 
+    // Number of hold-out samples verified on-chain in root mode
+    uint256 public constant HOLDOUT_K = 32;
+
     /*──────── Orchestrator economics & bookkeeping ────────*/
     uint256 public constant CLAIM_BOND_WEI = 0.005 ether;
-    uint256 public constant CLAIM_TTL      = 10;
-    uint256 public constant STALL_TTL      = 60;
+    uint256 public constant CLAIM_TTL      = 120;
+    uint256 public constant STALL_TTL      = 600;
     uint256 private constant WIN_W = 3;
     uint256 private constant LOS_W = 1;
 
@@ -55,10 +60,17 @@ contract AiOrchestrator is ReentrancyGuard {
         bytes32   trainingRoot;
         uint256   trainingLen;
 
-        // R3: holdout set
+        // R3 legacy (array mode – kept for backward compatibility)
         uint256[] hx0;
         uint256[] hx1;
         uint256[] hy;
+
+        // R3 scalable (Merkle root mode)
+        bytes32   holdoutRoot;
+        uint256   holdoutLen;
+        bool      holdoutRootSet;
+
+        // unified flag: true if either array-mode or root-mode holdout is present
         bool      holdoutSet;
 
         // settlement
@@ -98,7 +110,10 @@ contract AiOrchestrator is ReentrancyGuard {
 
     event ProofAccepted(uint256 id, uint256 idx, address node, uint256 acc);
     event OnChainAccChecked(uint256 id, uint256 idx, uint256 claimedAccBps, uint256 accOnChain, uint256 rows);
-    event RequestClosed(uint256 id, uint256 bestAcc, uint256 winnerTaskCount, uint256 perWinnerTaskWei, uint256 perLoserTaskWei);
+
+    // NEW for root-mode hold-out
+    event HoldoutRootSet(uint256 id, bytes32 root, uint256 len);
+    event OnChainAccSampled(uint256 id, uint256 idx, uint256 claimedAccBps, uint256 measuredAccBps, uint256 K);
 
     /*──────── Client API ────────*/
     function openRequest(
@@ -137,6 +152,7 @@ contract AiOrchestrator is ReentrancyGuard {
         emit TrainingRootSet(id, root, len);
     }
 
+    // Legacy array-mode hold-out (kept)
     function setHoldoutDataset(
         uint256 id,
         uint256[] calldata x0,
@@ -150,7 +166,25 @@ contract AiOrchestrator is ReentrancyGuard {
         for (uint256 i; i < x0.length; ++i) {
             require(x0[i] <= XMAX && x1[i] <= XMAX && (y[i] == 0 || y[i] == 1), "holdout out of range");
         }
-        q.hx0 = x0; q.hx1 = x1; q.hy = y; q.holdoutSet = true;
+        q.hx0 = x0; q.hx1 = x1; q.hy = y;
+        q.holdoutSet = true;
+    }
+
+    // NEW: scalable root-mode hold-out
+    function setHoldoutDatasetRoot(
+        uint256 id,
+        bytes32 root,
+        uint256 len
+    ) external {
+        Request storage q = R[id];
+        require(msg.sender == q.client, "only client");
+        require(!q.started, "already started");
+        require(root != bytes32(0) && len > 0, "bad holdout root");
+        q.holdoutRoot    = root;
+        q.holdoutLen     = len;
+        q.holdoutRootSet = true;
+        q.holdoutSet     = true;
+        emit HoldoutRootSet(id, root, len);
     }
 
     /*──────── Lobby ────────*/
@@ -196,6 +230,10 @@ contract AiOrchestrator is ReentrancyGuard {
         require(q.started && !q.closed, "bad state");
         require(idx < q.space.length, "bad idx");
         require(taskAcc[id][idx] == 0, "already proven");
+
+        // NEW: do not reassign if the worker already committed a transcript
+        require(trRoot[id][idx] == bytes32(0), "active transcript");
+
         address prev = taskOwner[id][idx];
         require(prev != address(0), "not claimed");
 
@@ -219,6 +257,7 @@ contract AiOrchestrator is ReentrancyGuard {
 
         emit TaskReassigned(id, idx, prev, b, q.bountyWei);
     }
+
 
     /*──────── Transcript + challenges (Track B+) ────────*/
     function commitTranscript(uint256 id, uint256 idx, bytes32 root, uint256 totalSteps) external {
@@ -251,6 +290,16 @@ contract AiOrchestrator is ReentrancyGuard {
         stepIndex = uint256(keccak256(abi.encodePacked(seed, i))) % total;
     }
 
+    // NEW: hold-out challenge index derived from per-task seed (root-mode)
+    function getHoldoutChallenge(uint256 id, uint256 idx, uint256 i) public view returns (uint256 sampleIndex) {
+        require(challengeK[id][idx] != 0, "not finalized");
+        Request storage q = R[id];
+        uint256 total = q.hx0.length > 0 ? q.hx0.length : q.holdoutLen;
+        require(total > 0, "no holdout");
+        bytes32 seed = trSeed[id][idx];
+        sampleIndex = uint256(keccak256(abi.encodePacked(seed, "holdout", i))) % total;
+    }
+
     function trainingChecksPassed(uint256 id, uint256 idx) public view returns (bool) {
         uint256 K = challengeK[id][idx];
         if (K == 0) return false;
@@ -267,9 +316,22 @@ contract AiOrchestrator is ReentrancyGuard {
         for (uint256 i; i < proof.length; ++i) h = _hashPair(h, proof[i]);
         return h == root;
     }
+    // packed variant for concatenated proofs
+    function _verifySortedPacked(
+        bytes32[] calldata proofs,
+        uint256 off,
+        uint256 count,
+        bytes32 root,
+        bytes32 leaf
+    ) internal pure returns (bool ok) {
+        bytes32 h = leaf;
+        for (uint256 i; i < count; ++i) {
+            h = _hashPair(h, proofs[off + i]);
+        }
+        return h == root;
+    }
 
     function _hashW(int256[W_SIZE] memory w) internal pure returns (bytes32) {
-        // encode all 17 ints into a packed hash
         return keccak256(abi.encodePacked(
             w[0],w[1],w[2],w[3],w[4],w[5],w[6],w[7],
             w[8],w[9],w[10],w[11],
@@ -302,9 +364,8 @@ contract AiOrchestrator is ReentrancyGuard {
         uint256 y,
         uint256 L
     ) internal pure returns (int256[W_SIZE] memory r) {
-        // unpack (views)
-        int256[W_SIZE] memory a = w; // local copy/mutable
-        // forward
+        int256[W_SIZE] memory a = w; // mutable local copy
+
         int256[4] memory pre;
         int256[4] memory s;
 
@@ -342,10 +403,10 @@ contract AiOrchestrator is ReentrancyGuard {
                 }
             }
         }
-        for (uint256 i = 0; i < W_SIZE; ++i) r[i] = a[i];
+        for (uint256 i; i < W_SIZE; ++i) r[i] = a[i];
     }
 
-    /*──────── Challenge answer ────────*/
+    /*──────── Challenge answer (R2) ────────*/
     function bindFinalWeights(
         uint256 id,
         uint256 idx,
@@ -374,7 +435,7 @@ contract AiOrchestrator is ReentrancyGuard {
         bytes32 leafTr = _leafForStep(stepIndex, wStart, wEnd);
         require(_verifySorted(trProof, trRoot[id][idx], leafTr), "bad merkle transcript");
 
-        // verify sample leaf and modulo index
+        // verify sample leaf and modulo index for training set
         require(sampleIndex == (stepIndex % q.trainingLen), "wrong sample idx");
         bytes32 leafSamp = _leafForSample(sampleIndex, x0, x1, y);
         require(_verifySorted(sampleProof, q.trainingRoot, leafSamp), "bad merkle sample");
@@ -410,6 +471,7 @@ contract AiOrchestrator is ReentrancyGuard {
         return (correct * 10000) / n;
     }
 
+    // Legacy submission path (full-array hold-out)
     function submitResult(
         uint256 id,
         uint256 idx,
@@ -422,6 +484,7 @@ contract AiOrchestrator is ReentrancyGuard {
         require(taskOwner[id][idx] == msg.sender, "task not yours");
         require(taskAcc[id][idx] == 0, "already proven");
         require(trainingChecksPassed(id, idx), "training checks incomplete");
+        require(q.hx0.length > 0, "array holdout not set"); // ensure array mode
 
         uint256 accOnChain = _accOnHoldout(finalW, q.hx0, q.hx1, q.hy);
         emit OnChainAccChecked(id, idx, claimedAccBps, accOnChain, q.hx0.length);
@@ -433,6 +496,81 @@ contract AiOrchestrator is ReentrancyGuard {
         if (b > 0) { credit[id][msg.sender] += b; taskBondWei[id][idx] = 0; }
 
         emit ProofAccepted(id, idx, msg.sender, claimedAccBps);
+        if (_allProven(id)) _computeSettlement(id);
+    }
+
+    // NEW: Root-mode submission path (K-sampled hold-out rows with Merkle proofs)
+    function submitResultWithHoldout(
+        uint256 id,
+        uint256 idx,
+        int256[W_SIZE] calldata finalW,
+        uint256 claimedAccBps,
+
+        // K entries parallel arrays
+        uint256[] calldata sampleIdx,
+        uint256[] calldata x0, uint256[] calldata x1, uint256[] calldata y,
+
+        // proofs are concatenated; sizes[i] tells how many nodes for sample i
+        bytes32[] calldata proofsConcat,
+        uint256[] calldata proofSizes
+    ) external nonReentrant {
+        Request storage q = R[id];
+        require(q.started && !q.closed, "bad state");
+        require(q.holdoutSet, "holdout not set");
+        require(taskOwner[id][idx] == msg.sender, "task not yours");
+        require(taskAcc[id][idx] == 0, "already proven");
+        require(trainingChecksPassed(id, idx), "training checks incomplete");
+
+        // If array-mode holdout was used, fall back to legacy path
+        if (q.hx0.length > 0) {
+            uint256 accOnChain = _accOnHoldout(finalW, q.hx0, q.hx1, q.hy);
+            emit OnChainAccChecked(id, idx, claimedAccBps, accOnChain, q.hx0.length);
+            require(accOnChain == claimedAccBps, "acc mismatch");
+            taskAcc[id][idx] = claimedAccBps;
+            uint256 b0 = taskBondWei[id][idx];
+            if (b0 > 0) { credit[id][msg.sender] += b0; taskBondWei[id][idx] = 0; }
+            emit ProofAccepted(id, idx, msg.sender, claimedAccBps);
+            if (_allProven(id)) _computeSettlement(id);
+            return;
+        }
+
+        require(q.holdoutRootSet && q.holdoutRoot != bytes32(0) && q.holdoutLen > 0, "no holdout root");
+
+        uint256 K = HOLDOUT_K;
+        if (K > q.holdoutLen) K = q.holdoutLen;
+
+        require(sampleIdx.length == K, "bad sampleIdx len");
+        require(x0.length == K && x1.length == K && y.length == K, "bad xyz len");
+        require(proofSizes.length == K, "bad sizes len");
+
+        uint256 off;
+        uint256 correct;
+
+        for (uint256 i; i < K; ++i) {
+            uint256 want = getHoldoutChallenge(id, idx, i);
+            require(sampleIdx[i] == want, "wrong sample idx");
+            require(x0[i] <= XMAX && x1[i] <= XMAX && (y[i] == 0 || y[i] == 1), "sample out of range");
+
+            bytes32 leaf = _leafForSample(want, x0[i], x1[i], y[i]);
+
+            uint256 sz = proofSizes[i];
+            require(off + sz <= proofsConcat.length, "bad proofs span");
+            require(_verifySortedPacked(proofsConcat, off, sz, q.holdoutRoot, leaf), "bad merkle sample");
+            off += sz;
+
+            if (_predict(finalW, x0[i], x1[i]) == y[i]) correct++;
+        }
+
+        uint256 measured = (correct * 10000) / K;
+        emit OnChainAccSampled(id, idx, claimedAccBps, measured, K);
+        require(measured == claimedAccBps, "acc mismatch");
+
+        taskAcc[id][idx] = measured;
+
+        uint256 b = taskBondWei[id][idx];
+        if (b > 0) { credit[id][msg.sender] += b; taskBondWei[id][idx] = 0; }
+
+        emit ProofAccepted(id, idx, msg.sender, measured);
         if (_allProven(id)) _computeSettlement(id);
     }
 
@@ -493,7 +631,13 @@ contract AiOrchestrator is ReentrancyGuard {
 
     /*──────── Views ────────*/
     function getSpace(uint256 id) external view returns (HyperParam[] memory) { return R[id].space; }
-    function datasetLength(uint256 id) external view returns (uint256) { return R[id].hx0.length; }
+
+    // Returns array length if legacy array-mode hold-out was used; otherwise root-mode length
+    function datasetLength(uint256 id) external view returns (uint256) {
+        Request storage q = R[id];
+        return (q.hx0.length > 0) ? q.hx0.length : q.holdoutLen;
+    }
+
     function provenCount(uint256 id) external view returns (uint256) { return _provenCount(id); }
 
     function taskStatsOf(uint256 id, address who)
@@ -519,4 +663,6 @@ contract AiOrchestrator is ReentrancyGuard {
         for (uint256 i; i < q.space.length; ++i) if (taskAcc[id][i] == q.bestAcc) winTasks++;
         return (q.closed, q.bestAcc, winTasks, q.perWinnerTaskWei, q.perLoserTaskWei);
     }
+
+    event RequestClosed(uint256 id, uint256 bestAcc, uint256 winnerTaskCount, uint256 perWinnerTaskWei, uint256 perLoserTaskWei);
 }

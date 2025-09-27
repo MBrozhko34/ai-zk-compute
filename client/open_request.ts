@@ -1,3 +1,4 @@
+// client/open_request.ts
 import { ethers, TransactionReceipt, Log, EventLog } from "ethers";
 import * as dotenv from "dotenv";
 import * as fs from "fs";
@@ -5,7 +6,6 @@ dotenv.config();
 
 import OrchAbi from "../artifacts/contracts/AiOrchestrator.sol/AiOrchestrator.json";
 
-// Use a dedicated client key to avoid nonce collisions with workers.
 const PK = (process.env.CLIENT_PRIVATE_KEY || process.env.PRIVATE_KEY || "").trim();
 const ORCH_ADDR = (process.env.ORCH_ADDR || "").trim();
 const RPC_URL   = (process.env.RPC_URL   || "").trim();
@@ -18,7 +18,7 @@ if (!RPC_URL) throw new Error("RPC_URL missing");
 
 type Sample = { x0: number; x1: number; y: number };
 
-// Quantize floats in [0,1] to **0..15**  (MUST match contract XMAX=15 and worker)
+// Quantize floats in [0,1] to **0..15** (round-half-up) — MUST match worker & contract XMAX=15
 function quant01ToQ15(v: string | number): number {
   const f = typeof v === "number" ? v : parseFloat(String(v).trim());
   if (!Number.isFinite(f)) throw new Error(`bad number: ${v}`);
@@ -94,7 +94,6 @@ async function makeLocalNonceSender(
   provider: ethers.JsonRpcProvider,
   to: string
 ) {
-  // Start from "latest" to play nicely with automine
   let next = await provider.getTransactionCount(wallet.address, "latest");
 
   async function waitReceiptStrict(hash: string): Promise<TransactionReceipt> {
@@ -105,9 +104,7 @@ async function makeLocalNonceSender(
       if (got) return got;
       const direct = await provider.getTransactionReceipt(hash);
       if (direct) return direct;
-      if (Date.now() - start > MAX_MS) {
-        throw new Error(`tx ${hash} not mined within ${MAX_MS}ms`);
-      }
+      if (Date.now() - start > MAX_MS) throw new Error(`tx ${hash} not mined within ${MAX_MS}ms`);
       await new Promise((r) => setTimeout(r, 500));
     }
   }
@@ -118,7 +115,7 @@ async function makeLocalNonceSender(
         const tx = await wallet.sendTransaction({ to, data, value, nonce: next });
         const rcpt0 = await tx.wait();
         const rcpt  = rcpt0 ?? (await waitReceiptStrict(tx.hash));
-        next += 1;            // bump only after mined
+        next += 1;
         return rcpt;
       } catch (e: any) {
         const msg = explainError(e);
@@ -132,13 +129,12 @@ async function makeLocalNonceSender(
           continue;
         }
         if (msg.includes("cannot send both gasprice and maxfeepergas")) {
-          continue; // we never set fees; just retry
+          continue;
         }
         throw e;
       }
     }
   }
-
   return { send };
 }
 
@@ -160,25 +156,26 @@ async function makeLocalNonceSender(
 
   const sender = await makeLocalNonceSender(wallet, provider, orchAddr);
 
-  // Load datasets (now quantized to 0..15)
+  // Load datasets (quantize 0..15)
   const train = loadCsv2(TRAIN_CSV);
   const hold  = loadCsv2(HOLD_CSV);
+
   const trainRoot = buildTrainingRoot(train);
+  const holdRoot  = buildTrainingRoot(hold);  // same leaf rule (i, x0, x1, y)
   console.log(`training set: ${train.length} rows, root=${trainRoot}`);
   console.log(`hold-out set: ${hold.length} rows from ${HOLD_CSV}`);
 
-// client/open_request.ts
-const grid = [
-  { lr:   1_000, steps:  20 },
-  { lr:   5_000, steps:  80 },   // a bit larger
-  { lr:  20_000, steps: 160 },
-  { lr:  50_000, steps: 400 },
-  { lr:  80_000, steps: 800 },
-  { lr: 120_000, steps: 800 },
-  { lr: 150_000, steps: 2000 },
-  { lr:     500, steps:   8 },
-];
-
+  // Hyperparam grid (you can enlarge freely now)
+  const grid: Array<{ lr: bigint | number; steps: bigint | number }> = [
+    { lr:   5_000,  steps:  1 },  // L=1, very underfit
+    { lr:   5_000,  steps:  2 },  // L=1
+    { lr:  20_000,  steps:  4 },  // L=1
+    { lr:  50_000,  steps:  6 },  // L=2
+    { lr:  80_000,  steps:  8 },  // L=2
+    { lr: 100_000,  steps: 10 },  // L=3
+    { lr: 120_000,  steps: 12 },  // L=3
+    { lr: 150_000,  steps: 16 },  // L=3
+  ];
 
   const perTask = ethers.parseEther("0.01");
   const bounty  = perTask * BigInt(grid.length);
@@ -192,7 +189,7 @@ const grid = [
   ]);
   const rcptOpen: TransactionReceipt = await sender.send(dataOpen, bounty);
 
-  // Recover id from logs
+  // Recover id
   const topicReqOpened = ethers.id("RequestOpened(uint256,uint256,uint256,uint256)");
   let openedId: bigint | null = null;
   const logs: Array<Log | EventLog> = (rcptOpen.logs ?? []) as Array<Log | EventLog>;
@@ -200,52 +197,27 @@ const grid = [
     if (log.address.toLowerCase() !== orchAddr.toLowerCase()) continue;
     const topic0 = (log as any).topics?.[0]?.toLowerCase?.() || "";
     if (topic0 !== topicReqOpened.toLowerCase()) continue;
-    const [id /*, taskCount, minWorkers, bountyWei*/] =
-      ethers.AbiCoder.defaultAbiCoder().decode(
-        ["uint256","uint256","uint256","uint256"],
-        (log as any).data
-      );
-    openedId = id as bigint;
-    break;
-  }
-  if (openedId === null) {
-    const raw = await provider.getLogs({
-      address: orchAddr,
-      topics: [topicReqOpened],
-      fromBlock: rcptOpen.blockNumber,
-      toBlock:   rcptOpen.blockNumber,
-    });
-    if (raw.length > 0) {
-      const last = raw[raw.length - 1];
-      const [id /*, taskCount, minWorkers, bountyWei*/] =
-        ethers.AbiCoder.defaultAbiCoder().decode(
-          ["uint256","uint256","uint256","uint256"],
-          last.data
-        );
-      openedId = id as bigint;
-    }
+    const [id] = ethers.AbiCoder.defaultAbiCoder().decode(
+      ["uint256","uint256","uint256","uint256"], (log as any).data
+    );
+    openedId = id as bigint; break;
   }
   if (openedId === null) throw new Error("Could not recover RequestOpened.id from logs");
   console.log("request id", openedId.toString());
 
   // 2) setTrainingDatasetRoot
   const dataRoot = orch.interface.encodeFunctionData("setTrainingDatasetRoot", [
-    openedId,
-    trainRoot,
-    train.length,
+    openedId, trainRoot, train.length,
   ]);
   await sender.send(dataRoot);
 
-  // 3) setHoldoutDataset
-  const hx0 = hold.map(s => BigInt(s.x0));
-  const hx1 = hold.map(s => BigInt(s.x1));
-  const hy  = hold.map(s => BigInt(s.y));
-  const dataHold = orch.interface.encodeFunctionData("setHoldoutDataset", [
-    openedId, hx0, hx1, hy
+  // 3) NEW: setHoldoutDatasetRoot (no more array upload!)
+  const dataHoldRoot = orch.interface.encodeFunctionData("setHoldoutDatasetRoot", [
+    openedId, holdRoot, hold.length,
   ]);
-  await sender.send(dataHold);
+  await sender.send(dataHoldRoot);
 
-  console.log("✓ training root and hold-out dataset set");
+  console.log("✓ training root and hold-out root set");
 })().catch((e) => {
   console.error(e);
   process.exit(1);
