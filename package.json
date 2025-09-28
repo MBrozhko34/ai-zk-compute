@@ -2,6 +2,7 @@
   "devDependencies": {
     "@nomicfoundation/hardhat-toolbox": "^6.1.0",
     "@typescript-eslint/parser": "^8.39.0",
+    "circomlib": "^2.0.5",
     "dotenv": "^17.2.1",
     "ethers": "^6.15.0",
     "hardhat": "^2.26.2",
@@ -12,9 +13,7 @@
   "dependencies": {
     "@openzeppelin/contracts": "^5.4.0"
   },
-
   "scripts": {
     "test:e2e": "mocha -r ts-node/register test/e2e/e2e.spec.ts --timeout 300000"
   }
 }
-
