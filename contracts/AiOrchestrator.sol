@@ -34,12 +34,13 @@ contract AiOrchestrator is ReentrancyGuard {
     uint256 private constant W_SIZE = 17;
 
     // Number of hold-out samples verified on-chain in root mode
-    uint256 public constant HOLDOUT_K = 32;
+    uint256 public constant HOLDOUT_K = 256;
 
     /*──────── Orchestrator economics & bookkeeping ────────*/
     uint256 public constant CLAIM_BOND_WEI = 0.005 ether;
     uint256 public constant CLAIM_TTL      = 300;
     uint256 public constant STALL_TTL      = 900;
+    uint256 public constant PROGRESS_TTL = 120;
     uint256 private constant WIN_W = 3;
     uint256 private constant LOS_W = 1;
 
@@ -82,6 +83,7 @@ contract AiOrchestrator is ReentrancyGuard {
     mapping(uint256 => Request) public R;
     uint256 public nextId;
 
+    mapping(uint256 => mapping(uint256 => uint256)) public lastProgressAt;
     // per-task
     mapping(uint256 => mapping(uint256 => address)) public taskOwner;
     mapping(uint256 => mapping(uint256 => uint256)) public taskAcc;     // acc_bps or 0
@@ -107,6 +109,8 @@ contract AiOrchestrator is ReentrancyGuard {
     event TranscriptCommitted(uint256 id, uint256 idx, address worker, bytes32 root, uint256 totalSteps);
     event ChallengesFinalized(uint256 id, uint256 idx, bytes32 seed, uint256 k);
     event ChallengeAnswered(uint256 id, uint256 idx, uint256 i, uint256 stepIndex);
+
+    event CreditWithdrawn(uint256 indexed id, address indexed to, uint256 amount);
 
     event ProofAccepted(uint256 id, uint256 idx, address node, uint256 acc);
     event OnChainAccChecked(uint256 id, uint256 idx, uint256 claimedAccBps, uint256 accOnChain, uint256 rows);
@@ -151,6 +155,17 @@ contract AiOrchestrator is ReentrancyGuard {
         q.trainingLen  = len;
         emit TrainingRootSet(id, root, len);
     }
+
+    // Add near Settlement & helpers
+    function withdraw(uint256 id) external nonReentrant {
+        uint256 amt = credit[id][msg.sender];
+        require(amt > 0, "no credit");
+        credit[id][msg.sender] = 0;
+        (bool ok, ) = payable(msg.sender).call{value: amt}("");
+        require(ok, "xfer");
+        emit CreditWithdrawn(id, msg.sender, amt);
+    }
+
 
     // Legacy array-mode hold-out (kept)
     function setHoldoutDataset(
@@ -218,6 +233,7 @@ contract AiOrchestrator is ReentrancyGuard {
                 taskOwner[id][i]   = msg.sender;
                 claimedAt[id][i]   = block.timestamp;
                 taskBondWei[id][i] = msg.value;
+                lastProgressAt[id][i] = block.timestamp;  
                 emit TaskClaimed(id, i, msg.sender, msg.value);
                 return i;
             }
@@ -231,33 +247,32 @@ contract AiOrchestrator is ReentrancyGuard {
         require(idx < q.space.length, "bad idx");
         require(taskAcc[id][idx] == 0, "already proven");
 
-        // NEW: do not reassign if the worker already committed a transcript
-        require(trRoot[id][idx] == bytes32(0), "active transcript");
-
         address prev = taskOwner[id][idx];
         require(prev != address(0), "not claimed");
 
-        bool lastUnproven = (_provenCount(id) == q.space.length - 1);
-        if (!lastUnproven) {
-            uint256 t = claimedAt[id][idx];
-            if (_majorityProven(id)) {
-                require(block.timestamp >= t + CLAIM_TTL, "not timed out");
-            } else {
-                require(block.timestamp >= t + STALL_TTL, "stall TTL");
-            }
-        }
+        uint256 base = _majorityProven(id) ? CLAIM_TTL : STALL_TTL;
+        uint256 t0   = claimedAt[id][idx];
+        uint256 lp   = lastProgressAt[id][idx];
+        uint256 nowT = block.timestamp;
 
+        // IMPORTANT: treat PROGRESS_TTL only once there is progress AFTER claim
+        bool hasProgress = (lp != 0 && lp > t0);
+
+        bool timedOut = (nowT >= t0 + base) || (hasProgress && nowT >= lp + PROGRESS_TTL);
+        require(timedOut, "not timed out");
+
+        // slash & reset as before
         uint256 b = taskBondWei[id][idx];
         if (b > 0) {
             q.bountyWei += b;
             taskBondWei[id][idx] = 0;
         }
-        taskOwner[id][idx] = address(0);
-        claimedAt[id][idx] = 0;
+        taskOwner[id][idx]       = address(0);
+        claimedAt[id][idx]       = 0;
+        lastProgressAt[id][idx]  = 0;
 
         emit TaskReassigned(id, idx, prev, b, q.bountyWei);
     }
-
 
     /*──────── Transcript + challenges (Track B+) ────────*/
     function commitTranscript(uint256 id, uint256 idx, bytes32 root, uint256 totalSteps) external {
@@ -266,6 +281,7 @@ contract AiOrchestrator is ReentrancyGuard {
         require(trRoot[id][idx] == bytes32(0), "already committed");
         trRoot[id][idx]  = root;
         trSteps[id][idx] = totalSteps;
+        lastProgressAt[id][idx] = block.timestamp;
         emit TranscriptCommitted(id, idx, msg.sender, root, totalSteps);
     }
 
@@ -279,6 +295,7 @@ contract AiOrchestrator is ReentrancyGuard {
         );
         trSeed[id][idx] = seed;
         challengeK[id][idx] = k;
+        lastProgressAt[id][idx] = block.timestamp;  
         emit ChallengesFinalized(id, idx, seed, k);
     }
 
@@ -286,9 +303,17 @@ contract AiOrchestrator is ReentrancyGuard {
         require(challengeK[id][idx] != 0, "not finalized");
         require(i < challengeK[id][idx], "i>=K");
         uint256 total = trSteps[id][idx];
+        require(total > 0, "no transcript");
+
+        // Anchor: first challenge is always step 0
+        if (i == 0) return 0;
+        if (total == 1) return 0; // only step 0 exists
+
         bytes32 seed = trSeed[id][idx];
-        stepIndex = uint256(keccak256(abi.encodePacked(seed, i))) % total;
+        // Draw from [1 .. total-1] for i>=1 to avoid duplicating the anchor
+        return 1 + (uint256(keccak256(abi.encodePacked(seed, i))) % (total - 1));
     }
+
 
     // NEW: hold-out challenge index derived from per-task seed (root-mode)
     function getHoldoutChallenge(uint256 id, uint256 idx, uint256 i) public view returns (uint256 sampleIndex) {
@@ -353,14 +378,64 @@ contract AiOrchestrator is ReentrancyGuard {
         return x;
     }
     function _lrBucket(uint256 lr) internal pure returns (uint256 L) {
-        // 8 buckets, about every 20k ppm
-        // L = clamp(1 + lr / 20_000, 1..8)
+        // Map ppm to 8 buckets (1..8). Thresholds chosen to fit your grid up to 150k.
+        //  <20k →1, [20k..40k)→2, [40k..60k)→3, [60k..80k)→4,
+        //  [80k..100k)→5, [100k..120k)→6, [120k..140k)→7, ≥140k→8
+        if (lr < 20_000) return 1;
+        if (lr < 40_000) return 2;
+        if (lr < 60_000) return 3;
+        if (lr < 80_000) return 4;
+        if (lr < 100_000) return 5;
+        if (lr < 120_000) return 6;
+        if (lr < 140_000) return 7;
+        return 8;
+    }
+
+    // Map a byte b to a small signed integer in [-limit .. +limit]
+    function _mapByteSigned(uint256 b, uint256 limit) internal pure returns (int256) {
         unchecked {
-            L = 1 + (lr / 20_000);
-            if (L < 1)  L = 1;
-            if (L > 8)  L = 8;
+            uint256 span = 2 * limit + 1;  // e.g., limit=3 => span=7
+            int256 u = int256(b % span);
+            return u - int256(limit);
         }
     }
+
+
+    function _detInitW(uint256 id, uint256 idx) internal view returns (int256[W_SIZE] memory w) {
+        // Seed includes id, idx, and the client's trainingRoot so W0 changes if the dataset changes.
+        bytes32 seed = keccak256(abi.encodePacked("init/", id, idx, R[id].trainingRoot));
+
+        uint256 counter = 0;
+        bytes32 buf = keccak256(abi.encodePacked(seed, counter));
+        uint256 pos = 0;
+
+        for (uint256 i = 0; i < W_SIZE; ++i) {
+            if (pos == 32) {
+                unchecked { counter++; }
+                buf = keccak256(abi.encodePacked(seed, counter));
+                pos = 0;
+            }
+            uint8 b = uint8(buf[pos]);
+            unchecked { pos++; }
+
+            if (i < 8) {
+                // First-layer weights w00..w31 ∈ [-3..3]
+                w[i] = _mapByteSigned(b, 3);
+            } else if (i < 12) {
+                // Hidden biases b0..b3 ∈ [-6..6]
+                w[i] = _mapByteSigned(b, 6);
+            } else if (i < 16) {
+                // Output weights v0..v3 ∈ [-2..2]
+                w[i] = _mapByteSigned(b, 2);
+            } else {
+                // Output bias b2 ∈ [-2..2]
+                w[i] = _mapByteSigned(b, 2);
+            }
+        }
+    }
+
+
+
 
     /*──────── Canonical one-step update for the 2→4→1 MLP ────────*/
     function _applyOneStepMLP(
@@ -440,6 +515,13 @@ contract AiOrchestrator is ReentrancyGuard {
         uint256 stepIndex = getChallenge(id, idx, i);
         bytes32 leafTr = _leafForStep(stepIndex, wStart, wEnd);
         require(_verifySorted(trProof, trRoot[id][idx], leafTr), "bad merkle transcript");
+        // Ensure the transcript really starts from our deterministic initializer
+        if (stepIndex == 0) {
+            int256[W_SIZE] memory want = _detInitW(id, idx);
+            for (uint256 t; t < W_SIZE; ++t) {
+                require(wStart[t] == want[t], "bad init");
+            }
+        }
 
         // verify sample leaf and modulo index for training set
         require(sampleIndex == (stepIndex % q.trainingLen), "wrong sample idx");
@@ -452,6 +534,7 @@ contract AiOrchestrator is ReentrancyGuard {
         for (uint256 t; t < W_SIZE; ++t) require(next[t] == wEnd[t], "bad update");
 
         answeredMask[id][idx] = mask | bit;
+        lastProgressAt[id][idx] = block.timestamp;  
         emit ChallengeAnswered(id, idx, i, stepIndex);
     }
 
@@ -497,6 +580,7 @@ contract AiOrchestrator is ReentrancyGuard {
         require(accOnChain == claimedAccBps, "acc mismatch");
 
         taskAcc[id][idx] = claimedAccBps;
+        lastProgressAt[id][idx] = block.timestamp;
 
         uint256 b = taskBondWei[id][idx];
         if (b > 0) { credit[id][msg.sender] += b; taskBondWei[id][idx] = 0; }
@@ -572,6 +656,7 @@ contract AiOrchestrator is ReentrancyGuard {
         require(measured == claimedAccBps, "acc mismatch");
 
         taskAcc[id][idx] = measured;
+        lastProgressAt[id][idx] = block.timestamp;
 
         uint256 b = taskBondWei[id][idx];
         if (b > 0) { credit[id][msg.sender] += b; taskBondWei[id][idx] = 0; }

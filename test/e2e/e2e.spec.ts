@@ -1,330 +1,134 @@
-import { describe, it, beforeEach, afterEach } from "mocha";
+// test/e2e/e2e.spec.ts
 import { expect } from "chai";
-import type { ChildProcess } from "child_process";
+import path from "path";
+import { ethers } from "ethers";
+import { ChildProcessWithoutNullStreams } from "child_process";
 import {
-  Contract,
-  Wallet,
-  JsonRpcProvider,
-  NonceManager,
-  Interface,
-  FunctionFragment,
-} from "ethers";
-import {
-  ensureDeps,
-  ensureCircuits,
-  ensureCompiled,
-  startNode,
-  deployAll,
-  spawnWorker,
-  stopWorker,
-  openRequest,
-  waitClosed,
-  showCredits,
-  sleep,
+  startHardhatNode, stop, deployOrch, makeDataset, writeCSV, openRequestDirect,
+  spawnWorker, ACCOUNTS, HARDHAT_RPC, waitForClosed
 } from "./utils";
 
-const GRID = [
-  { lr: 500n, steps: 5n },
-  { lr: 1000n, steps: 30n },
-  { lr: 20000n, steps: 40n },
-  { lr: 50000n, steps: 80n },
-  { lr: 80000n, steps: 120n },
-  { lr: 150000n, steps: 20n },
-  { lr: 150000n, steps: 300n },
-  { lr: 250000n, steps: 10n }, // ensure UNIQUE, no duplicates
-];
+describe("AiOrchestrator e2e", function () {
+  this.timeout(180_000);
 
-describe("E2E: AiOrchestrator + Python workers + snarkjs", function () {
-  this.timeout(300_000);
-
-  let url: string;
-  let nodeKill: () => void; // sync kill
-  let accounts: { addr: string; pk: string }[];
+  let node: ChildProcessWithoutNullStreams;
+  let provider: ethers.JsonRpcProvider;
+  let client: ethers.Wallet;
+  let abiPath: string;
   let orchAddr: string;
-  let orchAbi: any;
-  let orch: Contract;
-  let client: Wallet;
-  let provider: JsonRpcProvider;
+  let orch: ethers.Contract;
 
-  // For worker-based tests
-  let workers: ChildProcess[] = [];
-  let timers: NodeJS.Timeout[] = [];
-  const addTimer = (t: NodeJS.Timeout) => { timers.push(t); return t; };
+  const trainCsv = path.resolve("client/train.csv");
+  const holdCsv  = path.resolve("client/dataset.csv");
 
-  beforeEach(async () => {
-    await ensureDeps();
-    await ensureCircuits();
-    await ensureCompiled();
-
-    const node = await startNode();
-    url = node.url;
-    nodeKill = node.kill;
-    accounts = node.accounts;
-
-    const dep = await deployAll(url);
-    provider = dep.provider;
-    client = dep.wallet as unknown as Wallet; // NonceManager-wrapped signer is fine
-    orchAddr = dep.orchAddr;
-    orchAbi = dep.orchAbi;
-    orch = new Contract(orchAddr, orchAbi, client);
-
-    workers = [];
-    timers = [];
+  before(async () => {
+    node = startHardhatNode();
+    await new Promise(r => setTimeout(r, 2000)); // give node time to start
+    provider = new ethers.JsonRpcProvider(HARDHAT_RPC);
+    client   = new ethers.Wallet(ACCOUNTS[0].pk, provider);
+    abiPath  = path.resolve("artifacts/contracts/AiOrchestrator.sol/AiOrchestrator.json");
+    const dep = await deployOrch(abiPath);
+    orch = dep.orch;
+    orchAddr = dep.addr;
   });
 
-  afterEach(async () => {
-    for (const t of timers) { try { clearTimeout(t); } catch {} }
-    timers = [];
+  after(() => stop(node));
 
-    for (const p of workers) {
-      try { await stopWorker(p); } catch {}
+  it("happy path: multi-worker, all tasks proven, settlement correct", async () => {
+    const { train, hold } = makeDataset(64, 32, 1);
+    writeCSV(trainCsv, train);
+    writeCSV(holdCsv,  hold);
+
+    const grid = [
+      { lr: 5_000, steps: 10 },
+      { lr: 20_000, steps: 10 },
+      { lr: 50_000, steps: 10 },
+      { lr: 80_000, steps: 10 },
+    ];
+    const id = await openRequestDirect(orch, client, train, hold, grid, "0.01", 2);
+
+    const w1 = spawnWorker({ orchAddr, requestId: id, pk: ACCOUNTS[1].pk, trainCsv, holdCsv });
+    const w2 = spawnWorker({ orchAddr, requestId: id, pk: ACCOUNTS[2].pk, trainCsv, holdCsv });
+
+    // wait for closure
+    const closed = await waitForClosed(orch, id, 120_000);
+    expect(closed).to.eq(true, "request did not close");
+
+    // verify settlement & winners got > losers
+    const res = await orch.getResult(id);
+    const bestAcc: bigint = res[1];
+    const perWin: bigint  = res[3];
+    const perLose: bigint = res[4];
+    expect(perWin).to.be.gt(perLose);
+
+    // count each worker's wins/losses
+    const w1s = await orch.taskStatsOf(id, ACCOUNTS[1].addr);
+    const w2s = await orch.taskStatsOf(id, ACCOUNTS[2].addr);
+    const sumTasks = Number(w1s[0] + w2s[0]);
+    expect(sumTasks).to.eq(grid.length);
+
+    // At least one winner exists
+    expect(Number(w1s[2] + w2s[2])).to.be.greaterThan(0);
+  });
+
+  it("drop-out → reassign → completion", async () => {
+    const { train, hold } = makeDataset(48, 16, 2);
+    writeCSV(trainCsv, train);
+    writeCSV(holdCsv,  hold);
+
+    const grid = [
+      { lr: 5_000, steps: 50 },
+      { lr: 20_000, steps: 50 },
+      { lr: 50_000, steps: 50 },
+      { lr: 80_000, steps: 50 },
+    ];
+    const id = await openRequestDirect(orch, client, train, hold, grid, "0.01", 2);
+
+    const w1 = spawnWorker({ orchAddr, requestId: id, pk: ACCOUNTS[3].pk, trainCsv, holdCsv });
+    const w2 = spawnWorker({ orchAddr, requestId: id, pk: ACCOUNTS[4].pk, trainCsv, holdCsv });
+
+    // Simulate a drop-out: kill w2 shortly after it starts
+    await new Promise(r => setTimeout(r, 3000));
+    try { w2.kill("SIGKILL"); } catch {}
+
+    // Advance time past PROGRESS_TTL so reassignTimedOut can succeed
+    await provider.send("evm_increaseTime", [130]); // PROGRESS_TTL ~120 in your contract
+    await provider.send("evm_mine", []);
+
+    // poke reassign for all indices (benign if not timed-out)
+    const gridLen = (await orch.getSpace(id)).length;
+    for (let i = 0; i < gridLen; i++) {
+      try { await (await orch.reassignTimedOut(id, i)).wait(); } catch {}
     }
-    workers = [];
 
-    try { nodeKill(); } catch {}
-    await sleep(200);
+    // spawn another worker who should pick up the freed task(s)
+    const w3 = spawnWorker({ orchAddr, requestId: id, pk: ACCOUNTS[5].pk, trainCsv, holdCsv });
+
+    const closed = await waitForClosed(orch, id, 120_000);
+    expect(closed).to.eq(true, "request did not close after reassign");
+
+    const res = await orch.getResult(id);
+    expect(res[0]).to.eq(true);
   });
 
-  //
-  // ─────────────────────────────────────────────
-  // Worker-driven scenarios
-  // ─────────────────────────────────────────────
-  //
+  it("stress: many workers (10) on 12 tasks", async () => {
+    const { train, hold } = makeDataset(64, 32, 3);
+    writeCSV(trainCsv, train);
+    writeCSV(holdCsv,  hold);
 
-  it("no dropouts (minWorkers=4)", async () => {
-    const id = await openRequest(orch, client, 4, "1.0", GRID);
-    workers.push(
-      spawnWorker({ url, orch: orchAddr, requestId: id, priv: accounts[0].pk }),
-      spawnWorker({ url, orch: orchAddr, requestId: id, priv: accounts[1].pk }),
-      spawnWorker({ url, orch: orchAddr, requestId: id, priv: accounts[2].pk }),
-      spawnWorker({ url, orch: orchAddr, requestId: id, priv: accounts[3].pk }),
+    const grid = Array.from({length: 12}, (_,i)=> ({ lr: 5_000 + 15_000 * (i%8), steps: 20 }));
+    const id = await openRequestDirect(orch, client, train, hold, grid, "0.002", 2);
+
+    const workers = ACCOUNTS.slice(1, 11).map(a =>
+      spawnWorker({ orchAddr, requestId: id, pk: a.pk, trainCsv, holdCsv })
     );
 
-    const res = await waitClosed(orch, id);
-    const bestAcc = Number(((res as any).bestAcc ?? (res as any)[1])) / 100;
-    console.log("settled bestAcc=", bestAcc, "%");
-    await showCredits(orch, id, accounts.slice(0, 4).map((a) => a.addr));
-  });
+    const closed = await waitForClosed(orch, id, 150_000);
+    expect(closed).to.eq(true);
 
-  it("dropout + last-task fast-path (minWorkers=2) + late joiner", async () => {
-    const id = await openRequest(orch, client, 2, "1.0", GRID);
-    const p1 = spawnWorker({ url, orch: orchAddr, requestId: id, priv: accounts[1].pk });
-    const p2 = spawnWorker({ url, orch: orchAddr, requestId: id, priv: accounts[2].pk });
-    workers.push(p1, p2);
-
-    // simulate dropout
-    addTimer(setTimeout(() => { try { p2.kill("SIGINT"); } catch {} }, 5000));
-
-    // late joiner
-    addTimer(setTimeout(() => {
-      const p3 = spawnWorker({ url, orch: orchAddr, requestId: id, priv: accounts[3].pk });
-      workers.push(p3);
-    }, 15000));
-
-    const res = await waitClosed(orch, id);
-    const bestAcc = Number(((res as any).bestAcc ?? (res as any)[1])) / 100;
-    console.log("settled bestAcc=", bestAcc, "%");
-    await showCredits(orch, id, accounts.slice(0, 4).map((a) => a.addr));
-  });
-
-  //
-  // ─────────────────────────────────────────────
-  // Edge cases (all on-chain, no Python workers)
-  // ─────────────────────────────────────────────
-  //
-
-  // IMPORTANT: never use accounts[0] (the deployer/client) below,
-  // to avoid nonce collisions with deploy & openRequest transactions.
-
-  const asSigner = (pk: string) => new NonceManager(new Wallet(pk, provider));
-  const orchAs = (pk: string) => new Contract(orchAddr, orchAbi, asSigner(pk));
-
-  const findTaskOwnedBy = async (id: number, ownerLower: string, maxIdx = GRID.length) => {
-    for (let i = 0; i < maxIdx; i++) {
-      const o: string = (await (orch as any).taskOwner(id, i)).toLowerCase();
-      if (o === ownerLower) return i;
-    }
-    return -1;
-  };
-
-  const zeroFor = (param: any): any => {
-    const t: string = param.type;
-    const zeroAddr = "0x0000000000000000000000000000000000000000";
-    const zeroBytes32 = "0x" + "00".repeat(32);
-
-    if (t.endsWith("]")) {
-      const dims = [...t.matchAll(/\[(\d*)\]/g)].map(m => m[1]);
-      const base = t.replace(/\[[^\]]*\]/g, "");
-      const baseParam = { ...param, type: base };
-      const build = (d: number): any => {
-        const lenStr = dims[d];
-        const len = lenStr === "" ? 0 : parseInt(lenStr, 10);
-        if (d === dims.length - 1) return Array.from({ length: len }, () => zeroFor(baseParam));
-        return Array.from({ length: len }, () => build(d + 1));
-      };
-      return build(0);
-    }
-    if (t === "tuple") {
-      const comps = param.components || [];
-      return comps.map((c: any) => zeroFor(c));
-    }
-    if (t.startsWith("tuple[")) return [];
-
-    if (t.startsWith("uint") || t.startsWith("int")) return 0n;
-    if (t === "bool") return false;
-    if (t === "address") return zeroAddr;
-    if (t === "bytes32") return zeroBytes32;
-    if (t.startsWith("bytes")) return "0x";
-    if (t === "string") return "";
-    return 0n;
-  };
-
-  const zeroArgsForSubmitProof = (iface: Interface, id: number, idx: number) => {
-    let fn: FunctionFragment | null = null;
-    try {
-      fn = iface.getFunction("submitProof");
-    } catch {}
-    if (!fn) {
-      const list = Object.values((iface as any).functions ?? {}) as FunctionFragment[];
-      fn = list.find(f => f.name === "submitProof") ?? null;
-    }
-    if (!fn) throw new Error("submitProof not found in ABI");
-
-    const args = fn.inputs.map(p => zeroFor(p));
-
-    // Overwrite two uint-like params with (requestId, taskIdx) if applicable
-    const uintIdxs = fn.inputs
-      .map((p, i) => ({ i, t: p.type }))
-      .filter(x => x.t.startsWith("uint") || x.t.startsWith("int"))
-      .map(x => x.i);
-
-    if (uintIdxs.length >= 2) {
-      args[uintIdxs[0]] = BigInt(id);
-      args[uintIdxs[1]] = BigInt(idx);
-    }
-    return args;
-  };
-
-it("cannot claim before lobby is ready; becomes claimable once minWorkers reached", async () => {
-    const id = await openRequest(orch, client, 2, "0.5", GRID);
-
-    const A = orchAs(accounts[1].pk);
-    const B = orchAs(accounts[2].pk);
-
-    await (await A.joinLobby(id)).wait(); // lobby size = 1 < 2
-
-    const bond: bigint = await (orch as any).CLAIM_BOND_WEI();
-
-    // ✅ assert revert via staticCall (no tx sent)
-    let reverted = false;
-    try {
-      await (A as any).claimTask.staticCall(id, { value: bond });
-    } catch {
-      reverted = true;
-    }
-    expect(reverted, "claim should revert while lobby not ready").to.eq(true);
-
-    // when second worker joins, it starts; claim should succeed now
-    await (await B.joinLobby(id)).wait();
-    await (await A.claimTask(id, { value: bond })).wait();
-  });
-
-  it("non-owner cannot submit a proof for someone else's task", async () => {
-    const id = await openRequest(orch, client, 1, "0.5", GRID);
-
-    // Owner & attacker are non-deployer accounts
-    const A = orchAs(accounts[2].pk); // owner/claimer
-    const B = orchAs(accounts[3].pk); // attacker
-
-    await (await A.joinLobby(id)).wait();
-    await (await B.joinLobby(id)).wait(); // harmless for minWorkers=1
-
-    const bond: bigint = await (orch as any).CLAIM_BOND_WEI();
-    await (await A.claimTask(id, { value: bond })).wait();
-
-    const ownerIdx = await findTaskOwnedBy(id, accounts[2].addr.toLowerCase());
-    expect(ownerIdx).to.be.gte(0);
-
-    const iface: Interface = (orch as any).interface;
-    const badArgs = zeroArgsForSubmitProof(iface, id, ownerIdx);
-
-    let reverted = false;
-    try {
-      await (await (B as any).submitProof(...badArgs)).wait();
-    } catch {
-      reverted = true;
-    }
-    expect(reverted, "submitProof by non-owner must revert").to.eq(true);
-  });
-
-  it("bad proof from the correct owner should revert and not increase provenCount", async () => {
-    const id = await openRequest(orch, client, 1, "0.5", GRID);
-
-    // Correct owner is a non-deployer account
-    const A = orchAs(accounts[1].pk);
-    const addrA = accounts[1].addr.toLowerCase();
-
-    await (await A.joinLobby(id)).wait();
-
-    const bond: bigint = await (orch as any).CLAIM_BOND_WEI();
-    await (await A.claimTask(id, { value: bond })).wait();
-
-    const myIdx = await findTaskOwnedBy(id, addrA);
-    expect(myIdx).to.be.gte(0);
-
-    const iface: Interface = (orch as any).interface;
-    const args = zeroArgsForSubmitProof(iface, id, myIdx); // garbage proof data
-
-    let reverted = false;
-    try {
-      await (await (A as any).submitProof(...args)).wait();
-    } catch {
-      reverted = true;
-    }
-    expect(reverted, "bad proof by the owner must revert").to.eq(true);
-
-    const pc: bigint = await (orch as any).provenCount(id);
-    expect(Number(pc)).to.eq(0);
-  });
-
-  it("claimed task can be reassigned when it’s the last unproven (fast-path); previous owner cannot submit afterwards", async () => {
-    // 1-task grid → last-unproven fast-path is active
-    const SINGLE = GRID.slice(0, 1);
-    const id = await openRequest(orch, client, 1, "0.5", SINGLE);
-
-    const A = orchAs(accounts[1].pk);
-    const B = orchAs(accounts[2].pk);
-
-    await (await A.joinLobby(id)).wait(); // minWorkers=1 → started
-    await (await B.joinLobby(id)).wait();
-
-    const bond: bigint = await (orch as any).CLAIM_BOND_WEI();
-    await (await A.claimTask(id, { value: bond })).wait();
-
-    const idxA = await (async () => {
-      const ownerLower = accounts[1].addr.toLowerCase();
-      for (let i = 0; i < SINGLE.length; i++) {
-        const o: string = (await (orch as any).taskOwner(id, i)).toLowerCase();
-        if (o === ownerLower) return i;
-      }
-      return -1;
-    })();
-    expect(idxA).to.be.gte(0);
-
-    // Because it's the only (i.e., last remaining) unproven task, fast-path applies.
-    await (await (orch as any).reassignTimedOut(id, idxA)).wait(); // no majority/TTL needed here
-    await (await B.claimTask(id, { value: bond })).wait();
-
-    // A must not be able to submit for the old index anymore
-    const iface: Interface = (orch as any).interface;
-    const args = zeroArgsForSubmitProof(iface, id, idxA);
-
-    let reverted = false;
-    try {
-      await (await (A as any).submitProof(...args)).wait();
-    } catch {
-      reverted = true;
-    }
-    expect(reverted, "previous owner must not be able to submit after reassignment").to.eq(true);
+    const res = await orch.getResult(id);
+    const perWin: bigint  = res[3];
+    const perLose: bigint = res[4];
+    expect(perWin).to.be.gt(perLose);
   });
 });

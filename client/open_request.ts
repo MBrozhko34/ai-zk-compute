@@ -167,14 +167,47 @@ async function makeLocalNonceSender(
 
   // Hyperparam grid (you can enlarge freely now)
   const grid: Array<{ lr: bigint | number; steps: bigint | number }> = [
-    { lr:   5_000,  steps:  1 },  // L=1, very underfit
-    { lr:   5_000,  steps:  2 },  // L=1
-    { lr:  20_000,  steps:  4 },  // L=1
-    { lr:  50_000,  steps:  6 },  // L=2
-    { lr:  80_000,  steps:  8 },  // L=2
-    { lr: 100_000,  steps: 10 },  // L=3
-    { lr: 120_000,  steps: 12 },  // L=3
-    { lr: 150_000,  steps: 16 },  // L=3
+    { lr: 5_000,   steps: 1 },
+    { lr: 5_000,   steps: 50 },
+    { lr: 5_000,   steps: 300 },
+    // { lr: 5_000,   steps: 1_000 },
+    // { lr: 5_000,   steps: 5_000 },
+
+    { lr: 20_000,  steps: 1 },
+    { lr: 20_000,  steps: 50 },
+    { lr: 20_000,  steps: 300 },
+    // { lr: 20_000,  steps: 1_000 },
+    // { lr: 20_000,  steps: 5_000 },
+
+    { lr: 50_000,  steps: 1 },
+    { lr: 50_000,  steps: 50 },
+    { lr: 50_000,  steps: 300 },
+    // { lr: 50_000,  steps: 1_000 },
+    // { lr: 50_000,  steps: 5_000 },
+
+    { lr: 80_000,  steps: 1 },
+    { lr: 80_000,  steps: 50 },
+    { lr: 80_000,  steps: 300 },
+    // { lr: 80_000,  steps: 1_000 },
+    // { lr: 80_000,  steps: 5_000 },
+
+    // { lr: 100_000, steps: 1 },
+    // { lr: 100_000, steps: 50 },
+    // { lr: 100_000, steps: 300 },
+    // { lr: 100_000, steps: 1_000 },
+    // { lr: 100_000, steps: 5_000 },
+
+    // { lr: 120_000, steps: 1 },
+    // { lr: 120_000, steps: 50 },
+    // { lr: 120_000, steps: 300 },
+    // { lr: 120_000, steps: 1_000 },
+    // { lr: 120_000, steps: 5_000 },
+
+    { lr: 150_000, steps: 1 },
+    { lr: 150_000, steps: 50 },
+    // { lr: 150_000, steps: 300 },
+    // { lr: 150_000, steps: 1_000 },
+    // { lr: 150_000, steps: 5_000 },
   ];
 
   const perTask = ethers.parseEther("0.01");
