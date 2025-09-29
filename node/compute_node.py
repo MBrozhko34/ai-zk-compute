@@ -618,11 +618,9 @@ def do_task(idx: int, lr_ppm: int, steps: int):
         print(f"        context [{lo}:{hi}]:")
         print(f"        input_vec slice : {input_vec[lo:hi]}")
         print(f"        public.json slice: {public_signals[lo:hi]}")
-        # show first few limbs for quick inspection
         print(f"        mask_p[0..2]={mask_p[:3]}  x0_p[0..2]={x0_p[:3]}  x1_p[0..2]={x1_p[:3]}  y_p[0..2]={y_p[:3]}")
         return
 
-    # Optional: direct preflight against the verifier (isolates orchestrator)
     try:
         ver_addr = orch.functions.accVerifier().call()
         ver_abi = [{
@@ -646,7 +644,7 @@ def do_task(idx: int, lr_ppm: int, steps: int):
         print("   [zk] verifier preflight reverted:", explain_web3_error(e))
         return
 
-    # Now send to orchestrator (contract re-packs from full arrays; OK)
+    # Now send to orchestrator 
     try:
         send_tx(
             orch.functions.submitResultZK(

@@ -3,9 +3,6 @@ pragma solidity ^0.8.28;
 
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
-// ─── add a file‑level constant so the size is explicit ─────────────────────────
-// uint256 constant N_PUBLIC = 67;
-
 // number of 32-entry limbs for 256 rows
 uint256 constant LIMBS    = 256 / 32;                   // 8
 uint256 constant N_PUBLIC = 1 + (2 * 17) + (4 * LIMBS);   // 67
@@ -27,7 +24,6 @@ interface IGroth16Verifier {
  *   • R2: worker commits training transcript root and answers K random step checks
  *   • R3: hold‑out accuracy is proved **only** via Groth16 over K sampled rows
  *
- * This build removes legacy array hold‑out and non‑zk submission paths.
  */
 contract AiOrchestrator is ReentrancyGuard {
     /*──────── Model & data constants ────────*/
@@ -451,7 +447,7 @@ contract AiOrchestrator is ReentrancyGuard {
         emit ChallengeAnswered(id, idx, i, stepIndex);
     }
 
-    /*──────── zk submit (ONLY path) ────────*/
+    /*──────── zk submit ────────*/
     function submitResultZK(
         uint256 id,
         uint256 idx,
@@ -512,18 +508,11 @@ contract AiOrchestrator is ReentrancyGuard {
             }
         }
 
-        // Build public input for Groth16 verifier:
-        // [ acc_bps,
-        //   w_abs[17], w_sign[17],
-        //   mask[256], x0[256], x1[256], y[256] ]
-        // Build public input for Groth16 verifier:
         // Build public input for Groth16 verifier (packed form):
         // [ acc_bps,
         //   w_abs[17], w_sign[17],
         //   mask_p[8], x0_p[8], x1_p[8], y_p[8] ]
 
-               // --- Build public input for Groth16 verifier (packed form) ---
-               // --- Build public input for Groth16 verifier (packed form) ---
         // Circuit order: [ acc_bps, w_abs[17], w_sign[17],
         //                  mask_p[8], x0_p[8], x1_p[8], y_p[8] ]
         uint256[N_PUBLIC] memory input;
