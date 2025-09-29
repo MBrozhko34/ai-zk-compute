@@ -11,7 +11,7 @@ const ORCH_ADDR   = process.env.ORCH_ADDR!;
 const RPC_URL     = process.env.RPC_URL!;
 const PK          = process.env.PRIVATE_KEY!;
 const TRAIN_CSV   = process.env.TRAIN_CSV   || "client/train.csv";
-const HOLDOUT_CSV = process.env.HOLDOUT_CSV || "client/dataset2.csv";  // your bigger dataset
+const HOLDOUT_CSV = process.env.HOLDOUT_CSV || "client/dataset.csv";  // your bigger dataset
 const HOLDOUT_MODE = (process.env.HOLDOUT_MODE || "array").toLowerCase(); // "array" | "root"
 
 if (!ORCH_ADDR || !ORCH_ADDR.startsWith("0x")) throw new Error(`ORCH_ADDR missing/malformed: ${ORCH_ADDR}`);
