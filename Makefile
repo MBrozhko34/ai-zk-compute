@@ -3,12 +3,9 @@
 # ──────────────────────────────────────────────────────────────────────────────
 # General / deps
 # ──────────────────────────────────────────────────────────────────────────────
-.PHONY: setup deps clear nde depl req exp worker zk-ptau zk-circuit zk-setup zk-verifier zk-all
-
-setup: deps
+.PHONY: deps clear clean nde depl req exp worker zk-ptau mlp-zk
 
 deps:
-	pnpm install
 	cd node && python -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
 
 clear:
@@ -46,16 +43,6 @@ clean:
 
 	-rm -rf node/tmp/proof-0-*
 
-# ──────────────────────────────────────────────────────────────────────────────
-# (legacy XOR helpers kept for reference; not used by worker anymore)
-# ──────────────────────────────────────────────────────────────────────────────
-groth-circuit:
-	cd circuits && \
-		circom XorCircuit.circom --r1cs --wasm --sym -l ./lib && \
-		snarkjs groth16 setup XorCircuit.r1cs pot18_final.ptau xor_000.zkey && \
-		snarkjs zkey contribute xor_000.zkey xor_final.zkey --name="initial setup" -e="random entropy" && \
-		snarkjs zkey export verificationkey xor_final.zkey verification_key.json && \
-		snarkjs zkey export solidityverifier xor_final.zkey ../contracts/Groth16Verifier.sol
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Hardhat / deploy / request
@@ -130,9 +117,10 @@ worker:
 
 
 startup: clear clean mlp-zk nde
-	@echo "✅ startup complete: ran 'clear' → 'clean' → 'nde'"
+	@echo "✅ startup complete: ran 'clear' → 'clean' → 'mlp-zk' → 'nde'"
 
-client-side: depl req
+run: depl req
+	$(MAKE) REQ_ID=0 workers-12
 
 tidy: clear clean
 
