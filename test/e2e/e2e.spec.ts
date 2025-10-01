@@ -18,6 +18,7 @@ import {
   spawnWorker,
   stopWorker,
   openRequest,
+  commitDatasets,
   waitClosed,
   showCredits,
   sleep,
@@ -93,6 +94,7 @@ describe("E2E: AiOrchestrator + Python workers + snarkjs", function () {
 
   it("no dropouts (minWorkers=4)", async () => {
     const id = await openRequest(orch, client, 4, "1.0", GRID);
+    await commitDatasets(orch, client, id);
     workers.push(
       spawnWorker({ url, orch: orchAddr, requestId: id, priv: accounts[0].pk }),
       spawnWorker({ url, orch: orchAddr, requestId: id, priv: accounts[1].pk }),
@@ -108,6 +110,7 @@ describe("E2E: AiOrchestrator + Python workers + snarkjs", function () {
 
   it("dropout + last-task fast-path (minWorkers=2) + late joiner", async () => {
     const id = await openRequest(orch, client, 2, "1.0", GRID);
+    await commitDatasets(orch, client, id);
     const p1 = spawnWorker({ url, orch: orchAddr, requestId: id, priv: accounts[1].pk });
     const p2 = spawnWorker({ url, orch: orchAddr, requestId: id, priv: accounts[2].pk });
     workers.push(p1, p2);
@@ -207,6 +210,7 @@ describe("E2E: AiOrchestrator + Python workers + snarkjs", function () {
 
 it("cannot claim before lobby is ready; becomes claimable once minWorkers reached", async () => {
     const id = await openRequest(orch, client, 2, "0.5", GRID);
+    await commitDatasets(orch, client, id);
 
     const A = orchAs(accounts[1].pk);
     const B = orchAs(accounts[2].pk);
@@ -231,6 +235,7 @@ it("cannot claim before lobby is ready; becomes claimable once minWorkers reache
 
   it("non-owner cannot submit a proof for someone else's task", async () => {
     const id = await openRequest(orch, client, 1, "0.5", GRID);
+    await commitDatasets(orch, client, id);
 
     // Owner & attacker are non-deployer accounts
     const A = orchAs(accounts[2].pk); // owner/claimer
@@ -259,6 +264,7 @@ it("cannot claim before lobby is ready; becomes claimable once minWorkers reache
 
   it("bad proof from the correct owner should revert and not increase provenCount", async () => {
     const id = await openRequest(orch, client, 1, "0.5", GRID);
+    await commitDatasets(orch, client, id);
 
     // Correct owner is a non-deployer account
     const A = orchAs(accounts[1].pk);
@@ -291,6 +297,7 @@ it("cannot claim before lobby is ready; becomes claimable once minWorkers reache
     // 1-task grid → last-unproven fast-path is active
     const SINGLE = GRID.slice(0, 1);
     const id = await openRequest(orch, client, 1, "0.5", SINGLE);
+    await commitDatasets(orch, client, id);
 
     const A = orchAs(accounts[1].pk);
     const B = orchAs(accounts[2].pk);
@@ -326,5 +333,63 @@ it("cannot claim before lobby is ready; becomes claimable once minWorkers reache
       reverted = true;
     }
     expect(reverted, "previous owner must not be able to submit after reassignment").to.eq(true);
+  });
+
+    // ─────────────────────────────────────────────
+  // Bench: settlement time vs number of workers
+  // ─────────────────────────────────────────────
+
+  const GRID_BENCH = [
+    // Optional: a 12-task grid to saturate up to 12 workers; feel free to tweak.
+    { lr: 500n, steps: 5n },
+    { lr: 1000n, steps: 30n },
+    { lr: 20000n, steps: 40n },
+    { lr: 50000n, steps: 80n },
+    { lr: 80000n, steps: 120n },
+    { lr: 150000n, steps: 20n },
+    { lr: 150000n, steps: 300n },
+    { lr: 250000n, steps: 10n },
+    { lr: 30000n, steps: 60n },
+    { lr: 60000n, steps: 90n },
+    { lr: 90000n, steps: 150n },
+    { lr: 120000n, steps: 200n },
+  ];
+
+  async function benchOnce(N: number, grid = GRID_BENCH) {
+    // minWorkers = min(N, grid.length) so the lobby opens as soon as all workers join
+    const minWorkers = Math.min(N, grid.length);
+    const id = await openRequest(orch, client, minWorkers, "1.0", grid);
+    await commitDatasets(orch, client, id);
+
+    // Spawn N workers (skip deployer at index 0)
+    const t0 = Date.now();
+    for (let i = 0; i < N; i++) {
+      const pk = accounts[i + 1].pk; // accounts[0] is the client
+      workers.push(spawnWorker({ url, orch: orchAddr, requestId: id, priv: pk }));
+    }
+
+    const res = await waitClosed(orch, id);
+    const ms = Date.now() - t0;
+    const bestAcc = Number(((res as any).bestAcc ?? (res as any)[1])) / 100;
+
+    console.log(`[bench] workers=${N}, bestAcc=${bestAcc}%, duration_ms=${ms}`);
+    await showCredits(orch, id, accounts.slice(1, 1 + N).map((a) => a.addr));
+    return { ms, bestAcc };
+  }
+
+  it("bench: settle time for 3/6/9 workers", async function () {
+    this.timeout(900_000); // give plenty of time on cold machines
+
+    const Ns = [3];
+    for (const N of Ns) {
+      // Clean per-run timers/workers in case of prior test state
+      for (const t of timers) { try { clearTimeout(t); } catch {} }
+      timers = [];
+      for (const p of workers) { try { await stopWorker(p); } catch {} }
+      workers = [];
+
+      const { ms, bestAcc } = await benchOnce(N);
+      console.log(`[bench:summary] N=${N} → ${(ms/1000).toFixed(2)}s, bestAcc=${bestAcc}%`);
+    }
   });
 });
