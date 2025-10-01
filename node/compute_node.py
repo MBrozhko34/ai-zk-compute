@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import json, os, pathlib, time, re, subprocess, uuid
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any
 from decimal import Decimal, ROUND_HALF_UP
 from hexbytes import HexBytes
 from web3 import Web3, HTTPProvider
@@ -60,8 +60,16 @@ CLAIM_BURST_BACKOFF_MS = int(os.getenv("CLAIM_BURST_BACKOFF_MS", "200"))
 AUTO_WITHDRAW = os.getenv("AUTO_WITHDRAW", "1") == "1"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Utilities
+# Utilities & PERF helpers
 # ──────────────────────────────────────────────────────────────────────────────
+REQUEST_T0 = time.perf_counter()   # request wall-time start (for this worker only)
+TASK_PERF: List[Dict[str, Any]] = []  # collects per-task timings for this worker
+
+def _fmt_ms(ms: float) -> str:
+    if ms >= 1000.0:
+        return f"{ms/1000.0:.3f}s"
+    return f"{ms:.1f}ms"
+
 def _resolve_csv(path: str) -> str:
     p = pathlib.Path(path)
     if p.is_file(): return str(p)
@@ -423,6 +431,8 @@ def _s(x: int) -> str: return str(int(x))
 def _s_arr(xs: List[int]) -> List[str]: return [str(int(v)) for v in xs]
 
 def do_task(idx: int, lr_ppm: int, steps: int):
+    t_task_start = time.perf_counter()
+
     # Deterministic init using the client‑set training root (must match!)
     W0 = _det_init_w(REQ_ID, idx, samp_root)
 
@@ -546,10 +556,10 @@ def do_task(idx: int, lr_ppm: int, steps: int):
         d.mkdir(parents=True, exist_ok=True)
         return d
 
-    def _prove_and_verify_once(tmp_dir: pathlib.Path) -> Tuple[bool, Optional[Tuple[list, list, list]], Optional[list]]:
+    def _prove_and_verify_once(tmp_dir: pathlib.Path) -> Tuple[bool, Optional[Tuple[list, list, list]], Optional[list], Dict[str, float]]:
         """
-        Run wtns+prove once in tmp_dir. Return (ok, (a,b,c), public_signals) or (False, None, None)
-        on mismatch or failure.
+        Run wtns+prove once in tmp_dir.
+        Returns: (ok, (a,b,c) or None, public_signals or None, timings={wtns_ms, prove_ms, verify_ms, total_ms})
         """
         # Build an input.json where *all* numbers are decimal strings
         input_json = {
@@ -570,19 +580,24 @@ def do_task(idx: int, lr_ppm: int, steps: int):
         with open(tmp_dir / "input.json", "w") as f:
             json.dump(input_json, f)
 
-        def _run(cmd: str):
+        timings = {"wtns_ms": 0.0, "prove_ms": 0.0, "verify_ms": 0.0, "total_ms": 0.0}
+
+        def _run(cmd: str) -> float:
             print("   [zk] $", cmd)
+            t0 = time.perf_counter()
             c = subprocess.run(cmd, shell=True, cwd=str(tmp_dir), capture_output=True, text=True)
+            dt = (time.perf_counter() - t0) * 1000.0
             if c.returncode != 0:
                 print(c.stdout); print(c.stderr)
                 raise RuntimeError(f"zk cmd failed: {cmd}")
-            return c
+            return dt
 
+        t_all0 = time.perf_counter()
         cmd_wtns  = f'{SNARKJS} wtns calculate "{ACC_WASM}" "input.json" "witness.wtns"'
         cmd_prove = f'{SNARKJS} groth16 prove "{ACC_ZKEY}" "witness.wtns" "proof.json" "public.json"'
 
-        _run(cmd_wtns)
-        _run(cmd_prove)
+        timings["wtns_ms"]  = _run(cmd_wtns)
+        timings["prove_ms"] = _run(cmd_prove)
 
         # Read proof & public signals from THIS tmp_dir
         with open(tmp_dir / "proof.json", "r") as f:
@@ -605,14 +620,16 @@ def do_task(idx: int, lr_ppm: int, steps: int):
             arr = pub_raw.get("publicSignals", pub_raw.get("pubSignals"))
             if arr is None:
                 print("   [zk] ERROR: public.json missing publicSignals/pubSignals")
-                return (False, None, None)
+                timings["total_ms"] = (time.perf_counter() - t_all0) * 1000.0
+                return (False, None, None, timings)
             public_signals = [int(s) for s in arr]
 
-        expected_pub = 1 + 17 + 17 + 8 + 8 + 8 + 8  # 67
+        expected_pub = 67  # 1 + 17 + 17 + 8 + 8 + 8 + 8
         print(f"   [zk] public signals len = {len(public_signals)} (expected {expected_pub})")
         if len(public_signals) != expected_pub:
             print("   [zk] ERROR: public signals length mismatch.")
-            return (False, None, None)
+            timings["total_ms"] = (time.perf_counter() - t_all0) * 1000.0
+            return (False, None, None, timings)
 
         # Build the exact input vector (contract ABI order)
         input_vec = []
@@ -634,7 +651,8 @@ def do_task(idx: int, lr_ppm: int, steps: int):
             print(f"        input_vec slice : {input_vec[lo:hi]}")
             print(f"        public.json slice: {public_signals[lo:hi]}")
             print(f"        mask_p[0..2]={mask_p[:3]}  x0_p[0..2]={x0_p[:3]}  x1_p[0..2]={x1_p[:3]}  y_p[0..2]={y_p[:3]}")
-            return (False, None, None)
+            timings["total_ms"] = (time.perf_counter() - t_all0) * 1000.0
+            return (False, None, None, timings)
 
         # Verifier preflight
         try:
@@ -651,16 +669,21 @@ def do_task(idx: int, lr_ppm: int, steps: int):
             }]
             acc = w3.eth.contract(address=w3.to_checksum_address(ver_addr), abi=ver_abi)
             print("   [zk] verifier preflight call…")
+            t_v0 = time.perf_counter()
             ok = acc.functions.verifyProof(a, b, c, input_vec).call()
+            timings["verify_ms"] = (time.perf_counter() - t_v0) * 1000.0
             print(f"   [zk] verifier preflight result: {ok}")
             if not ok:
+                timings["total_ms"] = (time.perf_counter() - t_all0) * 1000.0
                 print("   [zk] Proof invalid against verifier.")
-                return (False, None, None)
+                return (False, None, None, timings)
         except Exception as e:
+            timings["total_ms"] = (time.perf_counter() - t_all0) * 1000.0
             print("   [zk] verifier preflight reverted:", explain_web3_error(e))
-            return (False, None, None)
+            return (False, None, None, timings)
 
-        return (True, (a, b, c), input_vec)
+        timings["total_ms"] = (time.perf_counter() - t_all0) * 1000.0
+        return (True, (a, b, c), input_vec, timings)
 
     # Prove with a few retries (fresh tmp dir each time)
     attempts = int(os.getenv("ZK_PROVE_MAX_ATTEMPTS", "3"))
@@ -669,11 +692,15 @@ def do_task(idx: int, lr_ppm: int, steps: int):
     a = b = c = None
     input_vec = None
     ok_any = False
+    attempt_timings: List[Dict[str, float]] = []
+
     for attempt in range(1, attempts+1):
         tmp_dir = _unique_tmp_dir(base_tmp, REQ_ID, idx)
         print(f"   [zk] proving attempt {attempt}/{attempts} in {tmp_dir}")
         try:
-            ok, proof_tuple, pub_vec = _prove_and_verify_once(tmp_dir)
+            ok, proof_tuple, pub_vec, tms = _prove_and_verify_once(tmp_dir)
+            attempt_timings.append(tms)
+            print(f"   [perf] attempt {attempt}: wtns={_fmt_ms(tms['wtns_ms'])}, prove={_fmt_ms(tms['prove_ms'])}, verify={_fmt_ms(tms['verify_ms'])}, total={_fmt_ms(tms['total_ms'])}")
             if ok and proof_tuple:
                 (a, b, c) = proof_tuple
                 input_vec = pub_vec
@@ -690,8 +717,21 @@ def do_task(idx: int, lr_ppm: int, steps: int):
         except Exception as e:
             print("   [zk] attempt error:", e)
 
+    prove_wall_ms = sum(x.get("total_ms", 0.0) for x in attempt_timings)
+
     if not ok_any:
         print("   [zk] giving up after retries; will let TTL/timeout reassign this task.")
+        t_task_end_fail = time.perf_counter()
+        TASK_PERF.append({
+            "task_idx": idx, "lr_ppm": lr_ppm, "steps": steps,
+            "acc_bps": acc_bps, "success": False,
+            "attempts": len(attempt_timings),
+            "prove_wall_ms": prove_wall_ms,
+            "wtns_ms_list": [x.get("wtns_ms", 0.0) for x in attempt_timings],
+            "prove_ms_list": [x.get("prove_ms", 0.0) for x in attempt_timings],
+            "verify_ms_list":[x.get("verify_ms", 0.0) for x in attempt_timings],
+            "task_wall_ms": (t_task_end_fail - t_task_start) * 1000.0
+        })
         return
 
     # Submit to orchestrator
@@ -710,6 +750,23 @@ def do_task(idx: int, lr_ppm: int, steps: int):
         print(f"   ✓ submitted result (zk) — K={K} → {acc_bps} bps")
     except Exception as e:
         print("   submitResultZK failed:", explain_web3_error(e))
+
+    # PERF record for successful task
+    t_task_end = time.perf_counter()
+    task_wall_ms = (t_task_end - t_task_start) * 1000.0
+    non_prove_ms = max(0.0, task_wall_ms - prove_wall_ms)
+    print(f"   [perf] task {idx}: total={_fmt_ms(task_wall_ms)} (prove={_fmt_ms(prove_wall_ms)}, non-prove={_fmt_ms(non_prove_ms)})")
+
+    TASK_PERF.append({
+        "task_idx": idx, "lr_ppm": lr_ppm, "steps": steps,
+        "acc_bps": acc_bps, "success": True,
+        "attempts": len(attempt_timings),
+        "prove_wall_ms": prove_wall_ms,
+        "wtns_ms_list": [x.get("wtns_ms", 0.0) for x in attempt_timings],
+        "prove_ms_list": [x.get("prove_ms", 0.0) for x in attempt_timings],
+        "verify_ms_list":[x.get("verify_ms", 0.0) for x in attempt_timings],
+        "task_wall_ms": task_wall_ms
+    })
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -778,5 +835,57 @@ print(f"   credit on-chain (pre-withdraw): {eth(my_credit_before)}")
 if AUTO_WITHDRAW and my_credit_before > 0:
     try: send_tx(orch.functions.withdraw(REQ_ID), min_gas=120_000)
     except Exception as e: print("   withdraw failed:", explain_web3_error(e))
+
+# ──────────────────────────────────────────────────────────────────────────────
+# END-OF-RUN: winners + performance summary
+# ──────────────────────────────────────────────────────────────────────────────
+try:
+    space = orch.functions.getSpace(REQ_ID).call()
+    n = len(space)
+    winners: List[int] = []
+    for i in range(n):
+        if int(orch.functions.taskAcc(REQ_ID, i).call()) == int(bestAcc):
+            winners.append(i)
+    print("\n========== RESULT SUMMARY ==========")
+    minWorkers, joinedCount, started = orch.functions.lobbyCounts(REQ_ID).call()
+    req_wall_ms = (time.perf_counter() - REQUEST_T0) * 1000.0
+    print(f"Request {REQ_ID}: closed={closed}  joined={joinedCount}  minWorkers={minWorkers}")
+    print(f"Best accuracy: {bestAcc} bps  |  Winners: {len(winners)}")
+    for i in winners:
+        lr_i, steps_i = int(space[i][0]), int(space[i][1])
+        owner_i = orch.functions.taskOwner(REQ_ID, i).call()
+        print(f"  • Winner task {i}: owner={owner_i}  lr={lr_i}  steps={steps_i}  acc={bestAcc} bps")
+
+    # This worker's performance summary
+    print("\n---------- This worker performance ----------")
+    if TASK_PERF:
+        total_prove = sum(x["prove_wall_ms"] for x in TASK_PERF)
+        total_task  = sum(x["task_wall_ms"]  for x in TASK_PERF)
+        succ = sum(1 for x in TASK_PERF if x["success"])
+        print(f"Tasks attempted: {len(TASK_PERF)}  |  succeeded: {succ}  |  failed: {len(TASK_PERF)-succ}")
+        for rec in TASK_PERF:
+            tag = "OK" if rec["success"] else "FAIL"
+            print(f"  task {rec['task_idx']} [{tag}] lr={rec['lr_ppm']} steps={rec['steps']} acc={rec['acc_bps']} bps  "
+                  f"task={_fmt_ms(rec['task_wall_ms'])}  prove={_fmt_ms(rec['prove_wall_ms'])}  "
+                  f"attempts={rec['attempts']}")
+            # Optional: show attempt micro-breakdown (first few)
+            if rec["attempts"] > 0:
+                a0 = rec["wtns_ms_list"]
+                a1 = rec["prove_ms_list"]
+                a2 = rec["verify_ms_list"]
+                for k in range(rec["attempts"]):
+                    print(f"    attempt {k+1}: wtns={_fmt_ms(a0[k])}, prove={_fmt_ms(a1[k])}, verify={_fmt_ms(a2[k])}")
+
+        avg_prove = total_prove / max(1, len(TASK_PERF))
+        print(f"\nTotal prove time (this worker): {_fmt_ms(total_prove)}   "
+              f"| Average prove per task: {_fmt_ms(avg_prove)}")
+        print(f"Total task wall time (this worker): {_fmt_ms(total_task)}")
+    else:
+        print("No tasks were completed by this worker.")
+
+    print(f"\nOverall request wall time (measured by this worker): {_fmt_ms(req_wall_ms)}")
+    print("=====================================\n")
+except Exception as e:
+    print("   summary failed:", e)
 
 print(f"[worker:{addr}] settled.")
