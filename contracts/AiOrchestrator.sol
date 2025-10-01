@@ -3,16 +3,13 @@ pragma solidity ^0.8.28;
 
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
-// number of 32-entry limbs for 256 rows
-uint256 constant LIMBS    = 256 / 32;                   // 8
-uint256 constant N_PUBLIC = 1 + (2 * 17) + (4 * LIMBS);   // 67
 
 interface IGroth16Verifier {
     function verifyProof(
         uint256[2] calldata a,
         uint256[2][2] calldata b,
         uint256[2] calldata c,
-        uint256[N_PUBLIC] memory input
+        uint256[67] memory input
     ) external view returns (bool);
 }
 
@@ -515,7 +512,7 @@ contract AiOrchestrator is ReentrancyGuard {
 
         // Circuit order: [ acc_bps, w_abs[17], w_sign[17],
         //                  mask_p[8], x0_p[8], x1_p[8], y_p[8] ]
-        uint256[N_PUBLIC] memory input;
+        uint256[67] memory input;
         uint256 p = 0;
 
         // 0) accuracy
@@ -534,12 +531,12 @@ contract AiOrchestrator is ReentrancyGuard {
         }
 
         // 3) mask_p[8], 4) x0_p[8], 5) x1_p[8], 6) y_p[8]
-        uint256[LIMBS] memory M;
-        uint256[LIMBS] memory X0;
-        uint256[LIMBS] memory X1;
-        uint256[LIMBS] memory Y;
+        uint256[8] memory M;
+        uint256[8] memory X0;
+        uint256[8] memory X1;
+        uint256[8] memory Y;
 
-        for (uint256 g; g < LIMBS; ++g) {
+        for (uint256 g; g < 8; ++g) {
             uint256 base = g * 32;
             uint256 mLimb; uint256 x0Limb; uint256 x1Limb; uint256 yLimb;
             for (uint256 k; k < 32; ++k) {
@@ -556,10 +553,10 @@ contract AiOrchestrator is ReentrancyGuard {
         }
 
         // append in circuit order (do NOT interleave by group)
-        for (uint256 g; g < LIMBS; ++g) input[p++] = M[g];
-        for (uint256 g; g < LIMBS; ++g) input[p++] = X0[g];
-        for (uint256 g; g < LIMBS; ++g) input[p++] = X1[g];
-        for (uint256 g; g < LIMBS; ++g) input[p++] = Y[g];
+        for (uint256 g; g < 8; ++g) input[p++] = M[g];
+        for (uint256 g; g < 8; ++g) input[p++] = X0[g];
+        for (uint256 g; g < 8; ++g) input[p++] = X1[g];
+        for (uint256 g; g < 8; ++g) input[p++] = Y[g];
 
         // Call the verifier with fixed-size public input
         bool ok = accVerifier.verifyProof(a, b, c, input);

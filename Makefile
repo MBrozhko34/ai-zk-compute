@@ -44,6 +44,8 @@ clean:
 	# Optional: wipe local zk scratch dir if you keep artifacts there
 	-rm -rf zk/*
 
+	-rm -rf node/tmp/proof-0-*
+
 # ──────────────────────────────────────────────────────────────────────────────
 # (legacy XOR helpers kept for reference; not used by worker anymore)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -133,3 +135,90 @@ startup: clear clean mlp-zk nde
 client-side: depl req
 
 tidy: clear clean
+
+# --------------------------------------------------------------------
+# QoL: allow REQ_ID alias (compat with earlier commands)
+# --------------------------------------------------------------------
+REQUEST_ID ?= $(REQ_ID)
+
+# --------------------------------------------------------------------
+# Local Hardhat dev private keys (NEVER use on real networks)
+# We start workers from #2 to avoid colliding with the deployer/client.
+# --------------------------------------------------------------------
+PK2  := 0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d
+PK3  := 0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a
+PK4  := 0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6
+PK5  := 0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a
+PK6  := 0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba
+PK7  := 0x92db14e403b83dfe3df233f83dfa3a0d7096f21ca9b0d6d6b8d88b2b4ec1564e
+PK8  := 0x4bbbf85ce3377467afe5d46f804f221813b2bb87f24d81f60f1fcdbf7cbf4356
+PK9  := 0xdbda1821b80551c9d65939329250298aa3472ba22feea921c0cf5d620ea67b97
+PK10 := 0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6
+PK11 := 0xf214f2b2cd398c806f84e317254e0f0b801d0643303237d97a22a48e01628897
+PK12 := 0x701b615bbdfb9de65240bc28bd21bbc0d996645a3dd57e7b12bc2bdf6f192c82
+PK13 := 0x47c99abed3324a2707c28affff1267e45918ec8c3f20b8aa892e8b065d2942dd
+
+# helper to error early if REQUEST_ID missing
+define _require_rid
+	@[ -n "$(REQUEST_ID)" ] || { echo "REQUEST_ID (or REQ_ID) is required"; exit 1; }
+endef
+
+.PHONY: workers-3 workers-6 workers-9 workers-12 stop-workers
+
+# Spawn 3 workers (accounts #2..#4)
+workers-3:
+	$(call _require_rid)
+	@echo "▶ Spawning 3 workers for REQUEST_ID=$(REQUEST_ID)"; \
+	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK2) & \
+	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK3) & \
+	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK4) & \
+	wait; echo "✅ workers-3 finished"
+
+# Spawn 6 workers (accounts #2..#7)
+workers-6:
+	$(call _require_rid)
+	@echo "▶ Spawning 6 workers for REQUEST_ID=$(REQUEST_ID)"; \
+	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK2) & \
+	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK3) & \
+	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK4) & \
+	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK5) & \
+	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK6) & \
+	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK7) & \
+	wait; echo "✅ workers-6 finished"
+
+# Spawn 9 workers (accounts #2..#10)
+workers-9:
+	$(call _require_rid)
+	@echo "▶ Spawning 9 workers for REQUEST_ID=$(REQUEST_ID)"; \
+	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK2)  & \
+	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK3)  & \
+	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK4)  & \
+	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK5)  & \
+	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK6)  & \
+	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK7)  & \
+	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK8)  & \
+	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK9)  & \
+	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK10) & \
+	wait; echo "✅ workers-9 finished"
+
+# Spawn 12 workers (accounts #2..#13)
+workers-12:
+	$(call _require_rid)
+	@echo "▶ Spawning 12 workers for REQUEST_ID=$(REQUEST_ID)"; \
+	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK2)  & \
+	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK3)  & \
+	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK4)  & \
+	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK5)  & \
+	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK6)  & \
+	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK7)  & \
+	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK8)  & \
+	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK9)  & \
+	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK10) & \
+	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK11) & \
+	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK12) & \
+	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK13) & \
+	wait; echo "✅ workers-12 finished"
+
+# Kill any backgrounded Python workers (best-effort)
+stop-workers:
+	-@pkill -f "compute_node\.py" || true

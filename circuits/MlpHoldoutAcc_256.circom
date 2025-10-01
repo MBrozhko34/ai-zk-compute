@@ -298,8 +298,12 @@ template MlpAcc256_PackedInputs() {
     component Py    = PackBits256();
     component Px0   = PackU4x256();
     component Px1   = PackU4x256();
-    for (var i2=0; i2<256; i2++) { Pmask.b[i2] <== mask[i2]; Py.b[i2] <== y[i2];
-                                   Px0.v[i2]   <== x0[i2];   Px1.v[i2] <== x1[i2]; }
+    for (var i2=0; i2<256; i2++) {
+        Pmask.b[i2] <== mask[i2];
+        Py.b[i2]    <== y[i2];
+        Px0.v[i2]   <== x0[i2];
+        Px1.v[i2]   <== x1[i2];
+    }
 
     for (var g=0; g<8; g++) {
         mask_p[g] === Pmask.limbs[g];

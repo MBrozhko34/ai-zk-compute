@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, os, pathlib, time, re, subprocess
+import json, os, pathlib, time, re, subprocess, uuid
 from typing import Optional, List, Tuple
 from decimal import Decimal, ROUND_HALF_UP
 from hexbytes import HexBytes
@@ -35,7 +35,6 @@ def _env_artifact(*names: str, default: str) -> str:
     if val is None:
         val = default
     s = val.strip().strip('"').strip("'")
-    # remove spaces immediately before/after path separators, underscores, dots
     s = re.sub(r'\s+(?=[_/\.])|(?<=[_/\.])\s+', '', s)
     return s
 
@@ -49,6 +48,9 @@ ACC_ZKEY = _env_artifact(
     default="../circuits/MlpHoldoutAcc_256_final.zkey"
 )
 
+# Normalize to absolute paths so cwd changes don’t break us
+ACC_WASM = str(pathlib.Path(ACC_WASM).resolve())
+ACC_ZKEY = str(pathlib.Path(ACC_ZKEY).resolve())
 print(f"   zk artifacts: wasm={ACC_WASM}  zkey={ACC_ZKEY}")
 
 # Claim/reassign tuning
@@ -395,6 +397,31 @@ def try_claim_one() -> Optional[int]:
         return None
     return idx
 
+# Helpers to pack limbs (Python mirror of Circom)
+def _pack_bits_256(bits: List[int]) -> List[int]:
+    limbs = []
+    for g in range(8):
+        base = g * 32
+        limb = 0
+        for k in range(32):
+            limb |= (int(bits[base + k]) & 1) << k
+        limbs.append(limb)
+    return limbs
+
+def _pack_u4_256(vals: List[int]) -> List[int]:
+    limbs = []
+    for g in range(8):
+        base = g * 32
+        limb = 0
+        for k in range(32):
+            limb |= (int(vals[base + k]) & 15) << (4 * k)
+        limbs.append(limb)
+    return limbs
+
+# Always serialize numeric values to decimal strings (avoid IEEE-754 rounding)
+def _s(x: int) -> str: return str(int(x))
+def _s_arr(xs: List[int]) -> List[str]: return [str(int(v)) for v in xs]
+
 def do_task(idx: int, lr_ppm: int, steps: int):
     # Deterministic init using the client‑set training root (must match!)
     W0 = _det_init_w(REQ_ID, idx, samp_root)
@@ -506,145 +533,168 @@ def do_task(idx: int, lr_ppm: int, steps: int):
 
     acc_bps = (correct * 10000) // K
 
-    # --- packers to match circuit/contract ---
-    def _pack_bits_256(bits: List[int]) -> List[int]:
-        limbs = []
-        for g in range(8):
-            base = g * 32
-            limb = 0
-            for k in range(32):
-                limb |= (int(bits[base + k]) & 1) << k
-            limbs.append(limb)
-        return limbs
-
-    def _pack_u4_256(vals: List[int]) -> List[int]:
-        limbs = []
-        for g in range(8):
-            base = g * 32
-            limb = 0
-            for k in range(32):
-                limb |= (int(vals[base + k]) & 15) << (4 * k)
-            limbs.append(limb)
-        return limbs
-
+    # Pack public limbs
     mask_p = _pack_bits_256(mask)
     y_p    = _pack_bits_256(hy)
     x0_p   = _pack_u4_256(hx0)
     x1_p   = _pack_u4_256(hx1)
 
-    # ── zk path only ───────────────────────────────────────────
-    tmp_dir = pathlib.Path("tmp"); tmp_dir.mkdir(parents=True, exist_ok=True)
-    input_json = {
-        # PUBLIC inputs
-        "acc_bps": int(acc_bps),
-        "w_abs": [abs(w) for w in finalW],
-        "w_sign": [1 if w < 0 else 0 for w in finalW],
-        "mask_p": mask_p,
-        "x0_p": x0_p,
-        "x1_p": x1_p,
-        "y_p": y_p,
+    # Per‑attempt isolated temp directory (avoid cross‑process clobber)
+    def _unique_tmp_dir(base: pathlib.Path, req_id: int, task_idx: int) -> pathlib.Path:
+        rnd = uuid.uuid4().hex[:8]
+        d = base / f"proof-{req_id}-{task_idx}-{os.getpid()}-{int(time.time()*1e6)}-{rnd}"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
 
-        # PRIVATE witness arrays
-        "mask": mask,
-        "x0": hx0, "x1": hx1, "y": hy
-    }
-    with open(tmp_dir / "input.json", "w") as f:
-        json.dump(input_json, f)
+    def _prove_and_verify_once(tmp_dir: pathlib.Path) -> Tuple[bool, Optional[Tuple[list, list, list]], Optional[list]]:
+        """
+        Run wtns+prove once in tmp_dir. Return (ok, (a,b,c), public_signals) or (False, None, None)
+        on mismatch or failure.
+        """
+        # Build an input.json where *all* numbers are decimal strings
+        input_json = {
+            # PUBLIC inputs
+            "acc_bps": _s(acc_bps),
+            "w_abs":   _s_arr([abs(w) for w in finalW]),
+            "w_sign":  _s_arr([1 if w < 0 else 0 for w in finalW]),
+            "mask_p":  _s_arr(mask_p),
+            "x0_p":    _s_arr(x0_p),
+            "x1_p":    _s_arr(x1_p),
+            "y_p":     _s_arr(y_p),
+            # PRIVATE witness arrays
+            "mask": _s_arr(mask),
+            "x0":   _s_arr(hx0),
+            "x1":   _s_arr(hx1),
+            "y":    _s_arr(hy),
+        }
+        with open(tmp_dir / "input.json", "w") as f:
+            json.dump(input_json, f)
 
-    def _run(cmd: str):
-        print("   [zk] $", cmd)
-        c = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        if c.returncode != 0:
-            print(c.stdout); print(c.stderr)
-            raise RuntimeError(f"zk cmd failed: {cmd}")
-        return c
+        def _run(cmd: str):
+            print("   [zk] $", cmd)
+            c = subprocess.run(cmd, shell=True, cwd=str(tmp_dir), capture_output=True, text=True)
+            if c.returncode != 0:
+                print(c.stdout); print(c.stderr)
+                raise RuntimeError(f"zk cmd failed: {cmd}")
+            return c
 
-    cmd_wtns  = f'{SNARKJS} wtns calculate "{ACC_WASM}" "{tmp_dir / "input.json"}" "{tmp_dir / "witness.wtns"}"'
-    cmd_prove = f'{SNARKJS} groth16 prove "{ACC_ZKEY}" "{tmp_dir / "witness.wtns"}" "{tmp_dir / "proof.json"}" "{tmp_dir / "public.json"}"'
+        cmd_wtns  = f'{SNARKJS} wtns calculate "{ACC_WASM}" "input.json" "witness.wtns"'
+        cmd_prove = f'{SNARKJS} groth16 prove "{ACC_ZKEY}" "witness.wtns" "proof.json" "public.json"'
 
-    try:
-        _run(cmd_wtns); _run(cmd_prove)
-    except Exception as e:
-        print("   zk proving failed:", e); return
+        _run(cmd_wtns)
+        _run(cmd_prove)
 
-    # --- Read proof & public signals robustly ---
-    with open(tmp_dir / "proof.json", "r") as f:
-        pr = json.load(f)
+        # Read proof & public signals from THIS tmp_dir
+        with open(tmp_dir / "proof.json", "r") as f:
+            pr = json.load(f)
 
-    def _hex2int(x): return int(x, 16) if isinstance(x, str) and x.startswith("0x") else int(x)
+        def _hex2int(x): return int(x, 16) if isinstance(x, str) and x.startswith("0x") else int(x)
 
-    # Fp2 order swap for Solidity: [c1, c0]
-    a = [_hex2int(pr["pi_a"][0]), _hex2int(pr["pi_a"][1])]
-    b = [
-        [_hex2int(pr["pi_b"][0][1]), _hex2int(pr["pi_b"][0][0])],
-        [_hex2int(pr["pi_b"][1][1]), _hex2int(pr["pi_b"][1][0])],
-    ]
-    c = [_hex2int(pr["pi_c"][0]), _hex2int(pr["pi_c"][1])]
+        a = [_hex2int(pr["pi_a"][0]), _hex2int(pr["pi_a"][1])]
+        b = [
+            [_hex2int(pr["pi_b"][0][1]), _hex2int(pr["pi_b"][0][0])],  # Fp2 order swap c1,c0
+            [_hex2int(pr["pi_b"][1][1]), _hex2int(pr["pi_b"][1][0])],
+        ]
+        c = [_hex2int(pr["pi_c"][0]), _hex2int(pr["pi_c"][1])]
 
-    with open(tmp_dir / "public.json", "r") as f:
-        pub_raw = json.load(f)
-    if isinstance(pub_raw, list):
-        public_signals = [int(s) for s in pub_raw]
-    elif isinstance(pub_raw, dict):
-        arr = pub_raw.get("publicSignals", pub_raw.get("pubSignals"))
-        if arr is None:
-            raise RuntimeError("public.json missing publicSignals/pubSignals")
-        public_signals = [int(s) for s in arr]
-    else:
-        raise RuntimeError("public.json has unexpected shape")
+        with open(tmp_dir / "public.json", "r") as f:
+            pub_raw = json.load(f)
+        if isinstance(pub_raw, list):
+            public_signals = [int(s) for s in pub_raw]
+        else:
+            arr = pub_raw.get("publicSignals", pub_raw.get("pubSignals"))
+            if arr is None:
+                print("   [zk] ERROR: public.json missing publicSignals/pubSignals")
+                return (False, None, None)
+            public_signals = [int(s) for s in arr]
 
-    expected_pub = 1 + 17 + 17 + 8 + 8 + 8 + 8  # 67
-    print(f"   [zk] public signals len = {len(public_signals)} (expected {expected_pub})")
-    if len(public_signals) != expected_pub:
-        print("   [zk] ERROR: public signals length mismatch. Check circuit/public order.")
+        expected_pub = 1 + 17 + 17 + 8 + 8 + 8 + 8  # 67
+        print(f"   [zk] public signals len = {len(public_signals)} (expected {expected_pub})")
+        if len(public_signals) != expected_pub:
+            print("   [zk] ERROR: public signals length mismatch.")
+            return (False, None, None)
+
+        # Build the exact input vector (contract ABI order)
+        input_vec = []
+        input_vec.append(int(acc_bps))
+        input_vec += [abs(int(w)) for w in finalW]               # w_abs[17]
+        input_vec += [1 if w < 0 else 0 for w in finalW]         # w_sign[17]
+        input_vec += mask_p                                      # mask_p[8]
+        input_vec += x0_p                                        # x0_p[8]
+        input_vec += x1_p                                        # x1_p[8]
+        input_vec += y_p                                         # y_p[8]
+
+        # Debug mismatch (should not happen now that we stringify)
+        mismatch_at = next((i for i, (a0, b0) in enumerate(zip(input_vec, public_signals)) if int(a0) != int(b0)), None)
+        if mismatch_at is not None:
+            lo = max(0, mismatch_at - 3)
+            hi = min(len(input_vec), mismatch_at + 4)
+            print(f"   [zk] MISMATCH at index {mismatch_at}: input_vec={input_vec[mismatch_at]} public={public_signals[mismatch_at]}")
+            print(f"        context [{lo}:{hi}]:")
+            print(f"        input_vec slice : {input_vec[lo:hi]}")
+            print(f"        public.json slice: {public_signals[lo:hi]}")
+            print(f"        mask_p[0..2]={mask_p[:3]}  x0_p[0..2]={x0_p[:3]}  x1_p[0..2]={x1_p[:3]}  y_p[0..2]={y_p[:3]}")
+            return (False, None, None)
+
+        # Verifier preflight
+        try:
+            ver_addr = orch.functions.accVerifier().call()
+            ver_abi = [{
+                "inputs":[
+                    {"internalType":"uint256[2]","name":"a","type":"uint256[2]"},
+                    {"internalType":"uint256[2][2]","name":"b","type":"uint256[2][2]"},
+                    {"internalType":"uint256[2]","name":"c","type":"uint256[2]"},
+                    {"internalType":"uint256[67]","name":"input","type":"uint256[67]"}
+                ],
+                "name":"verifyProof","outputs":[{"internalType":"bool","name":"","type":"bool"}],
+                "stateMutability":"view","type":"function"
+            }]
+            acc = w3.eth.contract(address=w3.to_checksum_address(ver_addr), abi=ver_abi)
+            print("   [zk] verifier preflight call…")
+            ok = acc.functions.verifyProof(a, b, c, input_vec).call()
+            print(f"   [zk] verifier preflight result: {ok}")
+            if not ok:
+                print("   [zk] Proof invalid against verifier.")
+                return (False, None, None)
+        except Exception as e:
+            print("   [zk] verifier preflight reverted:", explain_web3_error(e))
+            return (False, None, None)
+
+        return (True, (a, b, c), input_vec)
+
+    # Prove with a few retries (fresh tmp dir each time)
+    attempts = int(os.getenv("ZK_PROVE_MAX_ATTEMPTS", "3"))
+    base_tmp = pathlib.Path("tmp"); base_tmp.mkdir(parents=True, exist_ok=True)
+
+    a = b = c = None
+    input_vec = None
+    ok_any = False
+    for attempt in range(1, attempts+1):
+        tmp_dir = _unique_tmp_dir(base_tmp, REQ_ID, idx)
+        print(f"   [zk] proving attempt {attempt}/{attempts} in {tmp_dir}")
+        try:
+            ok, proof_tuple, pub_vec = _prove_and_verify_once(tmp_dir)
+            if ok and proof_tuple:
+                (a, b, c) = proof_tuple
+                input_vec = pub_vec
+                ok_any = True
+                if os.getenv("ZK_TMP_KEEP", "0") != "1":
+                    try:
+                        for p in tmp_dir.glob("*"): p.unlink()
+                        tmp_dir.rmdir()
+                    except Exception:
+                        pass
+                break
+            else:
+                print("   [zk] attempt failed; will retry with a fresh directory.")
+        except Exception as e:
+            print("   [zk] attempt error:", e)
+
+    if not ok_any:
+        print("   [zk] giving up after retries; will let TTL/timeout reassign this task.")
         return
 
-    # Build the exact packed input vector (matches contract)
-    input_vec = []
-    input_vec.append(int(acc_bps))
-    input_vec += [abs(int(w)) for w in finalW]               # w_abs[17]
-    input_vec += [1 if w < 0 else 0 for w in finalW]         # w_sign[17]
-    input_vec += mask_p                                      # mask_p[8]
-    input_vec += x0_p                                        # x0_p[8]
-    input_vec += x1_p                                        # x1_p[8]
-    input_vec += y_p                                         # y_p[8]
-
-    # Compare with snarkjs public.json (debug aid)
-    mismatch_at = next((i for i, (a0, b0) in enumerate(zip(input_vec, public_signals)) if int(a0) != int(b0)), None)
-    if mismatch_at is not None:
-        lo = max(0, mismatch_at - 3)
-        hi = min(len(input_vec), mismatch_at + 4)
-        print(f"   [zk] MISMATCH at index {mismatch_at}: input_vec={input_vec[mismatch_at]} public={public_signals[mismatch_at]}")
-        print(f"        context [{lo}:{hi}]:")
-        print(f"        input_vec slice : {input_vec[lo:hi]}")
-        print(f"        public.json slice: {public_signals[lo:hi]}")
-        print(f"        mask_p[0..2]={mask_p[:3]}  x0_p[0..2]={x0_p[:3]}  x1_p[0..2]={x1_p[:3]}  y_p[0..2]={y_p[:3]}")
-        return
-
-    try:
-        ver_addr = orch.functions.accVerifier().call()
-        ver_abi = [{
-            "inputs":[
-                {"internalType":"uint256[2]","name":"a","type":"uint256[2]"},
-                {"internalType":"uint256[2][2]","name":"b","type":"uint256[2][2]"},
-                {"internalType":"uint256[2]","name":"c","type":"uint256[2]"},
-                {"internalType":"uint256[67]","name":"input","type":"uint256[67]"}
-            ],
-            "name":"verifyProof","outputs":[{"internalType":"bool","name":"","type":"bool"}],
-            "stateMutability":"view","type":"function"
-        }]
-        acc = w3.eth.contract(address=w3.to_checksum_address(ver_addr), abi=ver_abi)
-        print("   [zk] verifier preflight call…")
-        ok = acc.functions.verifyProof(a, b, c, input_vec).call()
-        print(f"   [zk] verifier preflight result: {ok}")
-        if not ok:
-            print("   [zk] Proof invalid against verifier. Not sending tx.")
-            return
-    except Exception as e:
-        print("   [zk] verifier preflight reverted:", explain_web3_error(e))
-        return
-
-    # Now send to orchestrator 
+    # Submit to orchestrator
     try:
         send_tx(
             orch.functions.submitResultZK(
@@ -660,6 +710,7 @@ def do_task(idx: int, lr_ppm: int, steps: int):
         print(f"   ✓ submitted result (zk) — K={K} → {acc_bps} bps")
     except Exception as e:
         print("   submitResultZK failed:", explain_web3_error(e))
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CLAIM/WORK LOOP
