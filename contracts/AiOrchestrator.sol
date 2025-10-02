@@ -15,7 +15,7 @@ interface IGroth16Verifier {
 
 /**
  * ZK‑ONLY orchestrator (Groth16):
- *   • Model: integer MLP 2 → 4 → 1, weights in [-127,127], inputs x ∈ [0..15], y ∈ {0,1}
+ *   • Model: integer MLP 2-4-1, weights in [-127,127], inputs x ∈ [0..15], y ∈ {0,1}
  *   • R0: client commits Merkle root of training set (indexed leaves keccak(i,x0,x1,y))
  *   • R1: hyper‑params fixed by request.grid
  *   • R2: worker commits training transcript root and answers K random step checks
@@ -23,7 +23,7 @@ interface IGroth16Verifier {
  *
  */
 contract AiOrchestrator is ReentrancyGuard {
-    /*──────── Model & data constants ────────*/
+    /* Model & data constants */
     uint256 private constant NFEAT = 2;
     uint256 private constant H     = 4;
     int256  private constant CAP   = 127;  // weights/biases saturate in [-127, +127]
@@ -39,7 +39,7 @@ contract AiOrchestrator is ReentrancyGuard {
     // Number of hold‑out samples verified/used by zk circuit (masked to K if len<K)
     uint256 public constant HOLDOUT_K = 256;
 
-    /*──────── ZK verifier (Groth16) for holdout accuracy ────────*/
+    /* ZK verifier (Groth16) for holdout accuracy */
     IGroth16Verifier public accVerifier;
 
     constructor(IGroth16Verifier _accVerifier) {
@@ -47,7 +47,7 @@ contract AiOrchestrator is ReentrancyGuard {
         accVerifier = _accVerifier;
     }
 
-    /*──────── Economics & bookkeeping ────────*/
+    /* Economics & bookkeeping */
     uint256 public constant CLAIM_BOND_WEI = 0.005 ether;
     uint256 public constant CLAIM_TTL      = 300;
     uint256 public constant STALL_TTL      = 900;
@@ -101,7 +101,7 @@ contract AiOrchestrator is ReentrancyGuard {
     mapping(uint256 => mapping(uint256 => uint256)) public challengeK;
     mapping(uint256 => mapping(uint256 => uint256)) public answeredMask;
 
-    /*──────── Events ────────*/
+    /* Events */
     event RequestOpened(uint256 id, uint256 taskCount, uint256 minWorkers, uint256 bountyWei);
     event LobbyJoined(uint256 id, address node, uint256 joinedCount, uint256 minWorkers, bool started);
     event TaskClaimed(uint256 id, uint256 idx, address node, uint256 bondWei);
@@ -118,7 +118,7 @@ contract AiOrchestrator is ReentrancyGuard {
     event RequestClosed(uint256 id, uint256 bestAcc, uint256 winnerTaskCount, uint256 perWinnerTaskWei, uint256 perLoserTaskWei);
     event CreditWithdrawn(uint256 indexed id, address indexed to, uint256 amount);
 
-    /*──────── Client API ────────*/
+    /* Client API */
     function openRequest(
         string calldata cid,
         HyperParam[] calldata grid,
@@ -168,7 +168,7 @@ contract AiOrchestrator is ReentrancyGuard {
         emit HoldoutRootSet(id, root, len);
     }
 
-    /*──────── Lobby ────────*/
+    /* Lobby */
     function joinLobby(uint256 id) external nonReentrant {
         Request storage q = R[id];
         require(!q.closed, "closed");
@@ -184,7 +184,7 @@ contract AiOrchestrator is ReentrancyGuard {
         return (q.minWorkers, q.lobby.length, q.started);
     }
 
-    /*──────── Claim / timeout ────────*/
+    /* Claim / timeout */
     function claimTask(uint256 id) external payable nonReentrant returns (uint256 idx) {
         Request storage q = R[id];
         require(!q.closed, "closed");
@@ -240,7 +240,7 @@ contract AiOrchestrator is ReentrancyGuard {
     mapping(uint256 => mapping(uint256 => uint256)) public lastProgressAt;
     function _touchProgress(uint256 id, uint256 idx) internal { lastProgressAt[id][idx] = block.timestamp; }
 
-    /*──────── Merkle helpers (sorted‑pair) ────────*/
+    /* Merkle helpers (sorted‑pair) */
     function _hashPair(bytes32 a, bytes32 b) internal pure returns (bytes32) {
         return a < b ? keccak256(abi.encodePacked(a, b)) : keccak256(abi.encodePacked(b, a));
     }
@@ -275,7 +275,7 @@ contract AiOrchestrator is ReentrancyGuard {
         return keccak256(abi.encodePacked(idx, x0, x1, y));
     }
 
-    /*──────── Integer helpers ────────*/
+    /* Integer helpers */
     function _sgn(int256 v) internal pure returns (int256) { return v > 0 ? int256(1) : (v < 0 ? int256(-1) : int256(0)); }
     function _sat(int256 x) internal pure returns (int256) {
         if (x >  CAP) return CAP;
@@ -311,7 +311,7 @@ contract AiOrchestrator is ReentrancyGuard {
         }
     }
 
-    /*──────── Canonical one‑step update ────────*/
+    /* Canonical one‑step update */
     function _applyOneStepMLP(
         int256[W_SIZE] memory a,
         uint256 x0,
@@ -346,7 +346,7 @@ contract AiOrchestrator is ReentrancyGuard {
         for (uint256 i; i < W_SIZE; ++i) r[i] = a[i];
     }
 
-    /*──────── Transcript + challenges ────────*/
+    /* Transcript + challenges */
     function commitTranscript(uint256 id, uint256 idx, bytes32 root, uint256 totalSteps) external {
         require(taskOwner[id][idx] == msg.sender, "task not yours");
         require(root != bytes32(0) && totalSteps > 0, "bad transcript");
@@ -444,7 +444,7 @@ contract AiOrchestrator is ReentrancyGuard {
         emit ChallengeAnswered(id, idx, i, stepIndex);
     }
 
-    /*──────── zk submit ────────*/
+    /* zk submit */
     function submitResultZK(
         uint256 id,
         uint256 idx,
@@ -510,12 +510,10 @@ contract AiOrchestrator is ReentrancyGuard {
         //   w_abs[17], w_sign[17],
         //   mask_p[8], x0_p[8], x1_p[8], y_p[8] ]
 
-        // Circuit order: [ acc_bps, w_abs[17], w_sign[17],
-        //                  mask_p[8], x0_p[8], x1_p[8], y_p[8] ]
         uint256[67] memory input;
         uint256 p = 0;
 
-        // 0) accuracy
+        // 0)] accuracy
         input[p++] = claimedAccBps;
 
         // 1) |w| and 2) sign bits
@@ -552,7 +550,7 @@ contract AiOrchestrator is ReentrancyGuard {
             Y[g]  = yLimb;
         }
 
-        // append in circuit order (do NOT interleave by group)
+        // append in circuit order
         for (uint256 g; g < 8; ++g) input[p++] = M[g];
         for (uint256 g; g < 8; ++g) input[p++] = X0[g];
         for (uint256 g; g < 8; ++g) input[p++] = X1[g];
@@ -572,7 +570,7 @@ contract AiOrchestrator is ReentrancyGuard {
         if (_allProven(id)) _computeSettlement(id);
     }
 
-    /*──────── Settlement & views ────────*/
+    /* Settlement & views */
     function _allProven(uint256 id) internal view returns (bool) {
         Request storage q = R[id];
         for (uint256 i; i < q.space.length; ++i) if (taskAcc[id][i] == 0) return false;

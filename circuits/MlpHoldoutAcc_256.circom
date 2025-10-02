@@ -136,7 +136,7 @@ template MlpForwardUnsigned() {
     pred        <== outStep.out;
 }
 
-// ───────────────── batched accuracy over 256 rows ─────────────────
+// batched accuracy over 256 rows
 
 // Accuracy over 256 rows, with *private* arrays (mask/x0/x1/y) and
 // w_abs/w_sign + acc_bps as inputs. This keeps your original logic.
