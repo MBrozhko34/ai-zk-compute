@@ -342,7 +342,7 @@ hold_layers = build_merkle_layers_sorted(hold_leaves)
 try:
     if not orch.functions.joined(REQ_ID, addr).call():
         send_tx(orch.functions.joinLobby(REQ_ID))
-        print("   ✓ joined lobby")
+        print("joined lobby")
     else:
         print("   already joined lobby")
 except Exception as e:
@@ -437,7 +437,7 @@ def do_task(idx: int, lr_ppm: int, steps: int):
 
     train_acc = accuracy_on(finalW, tr_x0, tr_x1, tr_y)
     test_acc  = accuracy_on(finalW, te_x0, te_x1, te_y)
-    print(f"   [task {idx}] trained (bucket={lr_bucket(lr_ppm)}) → "
+    print(f"   [task {idx}] trained (bucket={lr_bucket(lr_ppm)}):  "
           f"train {100*train_acc:.2f}% | holdout {100*test_acc:.2f}%")
 
     # Commit transcript root
@@ -495,7 +495,7 @@ def do_task(idx: int, lr_ppm: int, steps: int):
                 ),
                 min_gas=480_000
             )
-            print(f"   ✓ answered challenge i={i} (step={step_idx} using sample={samp_idx})")
+            print(f"answered challenge i={i} (step={step_idx} using sample={samp_idx})")
         except Exception as e:
             print("   bindFinalWeights failed at i=%d:" % i, explain_web3_error(e)); return
 
@@ -734,7 +734,7 @@ def do_task(idx: int, lr_ppm: int, steps: int):
             ),
             min_gas=900_000
         )
-        print(f"   ✓ submitted result (zk) — K={K} → {acc_bps} bps")
+        print(f" submitted result (zk) — K={K}: {acc_bps} bps")
     except Exception as e:
         print("   submitResultZK failed:", explain_web3_error(e))
 

@@ -1,8 +1,3 @@
-// scripts/plonk_calldata.js
-// Usage: node scripts/plonk_calldata.js <proof.json> <public.json>
-// Prints either the classic "0x...,[...]" string OR a JSON array [ proofHexOrArray, pubsArray ].
-// We'll parse whatever it prints on the Python side.
-const fs = require("fs");
 const path = require("path");
 (async () => {
   try {
@@ -16,8 +11,6 @@ const path = require("path");
     const pubs  = JSON.parse(fs.readFileSync(path.resolve(publicPath), "utf8"));
 
     const cd = await plonk.exportSolidityCallData(proof, pubs);
-    // Some versions return a string "0x...,[pubs]"
-    // Some return an array [proofHexOrArray, pubs]
     if (Array.isArray(cd)) {
       console.log(JSON.stringify(cd));
     } else {
