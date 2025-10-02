@@ -1,8 +1,6 @@
 -include .env
 
-# ──────────────────────────────────────────────────────────────────────────────
 # General / deps
-# ──────────────────────────────────────────────────────────────────────────────
 .PHONY: deps clear clean nde depl req exp worker zk-ptau mlp-zk
 
 deps:
@@ -44,9 +42,7 @@ clean:
 	-rm -rf node/tmp/proof-0-*
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 # Hardhat / deploy / request
-# ──────────────────────────────────────────────────────────────────────────────
 nde:
 	pnpm hardhat compile
 	npx hardhat node
@@ -63,17 +59,10 @@ exp:
 	@echo 'export REQUEST_ID=0'
 	@echo 'export PRIVATE_KEY=<ONE_OF_HARDHAT_KEYS>'
 
-# ──────────────────────────────────────────────────────────────────────────────
 # ZK (Groth16) for the MLP hold-out accuracy circuit
-#   circuits/MlpHoldoutAcc_256.circom  →  zk/MlpHoldoutAcc_256_js/MlpHoldoutAcc_256.wasm
-# ──────────────────────────────────────────────────────────────────────────────
 CIRCOM     := npx circom
 SNARKJS    := npx snarkjs
 
-# --- zk (Groth16) for MLP hold-out accuracy ---
-# ── ZK (Groth16) artifacts for the MLP holdout circuit ───────────────────────
-# --- zk (Groth16) for MLP hold-out accuracy ---
-# Circuit basename (no spaces!)
 ACC_NAME := $(strip MlpHoldoutAcc_256)
 ACC_DIR  := circuits
 ACC_WASM := $(ACC_DIR)/$(ACC_NAME)_js/$(ACC_NAME).wasm
@@ -98,9 +87,7 @@ mlp-zk:
 		snarkjs zkey export verificationkey MlpHoldoutAcc_256_final.zkey verification_key.json && \
 		snarkjs zkey export solidityverifier MlpHoldoutAcc_256_final.zkey ../contracts/AccVerifier.sol
 
-# ──────────────────────────────────────────────────────────────────────────────
 # Worker – ensures zk artifacts exist (MLP), then runs the Python node
-# ──────────────────────────────────────────────────────────────────────────────
 worker:
 	@[ -n "$(RPC_URL)" ] || (echo "RPC_URL missing (set in .env or pass inline)"; exit 1)
 	@[ -n "$(ORCH_ADDR)" ] || (echo "ORCH_ADDR missing (set in .env or pass inline)"; exit 1)
@@ -117,22 +104,16 @@ worker:
 
 
 startup: clear clean mlp-zk nde
-	@echo "✅ startup complete: ran 'clear' → 'clean' → 'mlp-zk' → 'nde'"
+	@echo "startup complete: ran 'clear' → 'clean' → 'mlp-zk' → 'nde'"
 
 run: depl req
 	$(MAKE) REQ_ID=0 workers-12
 
 tidy: clear clean
 
-# --------------------------------------------------------------------
-# QoL: allow REQ_ID alias (compat with earlier commands)
-# --------------------------------------------------------------------
 REQUEST_ID ?= $(REQ_ID)
 
-# --------------------------------------------------------------------
 # Local Hardhat dev private keys (NEVER use on real networks)
-# We start workers from #2 to avoid colliding with the deployer/client.
-# --------------------------------------------------------------------
 PK2  := 0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d
 PK3  := 0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a
 PK4  := 0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6
@@ -170,7 +151,7 @@ workers-3:
 	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK2) & \
 	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK3) & \
 	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK4) & \
-	wait; echo "✅ workers-3 finished"
+	wait; echo "workers-3 finished"
 
 # Spawn 6 workers (accounts #2..#7)
 workers-6:
@@ -182,7 +163,7 @@ workers-6:
 	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK5) & \
 	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK6) & \
 	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK7) & \
-	wait; echo "✅ workers-6 finished"
+	wait; echo "workers-6 finished"
 
 # Spawn 9 workers (accounts #2..#10)
 workers-9:
@@ -197,7 +178,7 @@ workers-9:
 	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK8)  & \
 	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK9)  & \
 	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK10) & \
-	wait; echo "✅ workers-9 finished"
+	wait; echo "workers-9 finished"
 
 # Spawn 12 workers (accounts #2..#13)
 workers-12:
@@ -215,7 +196,7 @@ workers-12:
 	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK11) & \
 	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK12) & \
 	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK13) & \
-	wait; echo "✅ workers-12 finished"
+	wait; echo "workers-12 finished"
 
 # Kill any backgrounded Python workers (best-effort)
 stop-workers:

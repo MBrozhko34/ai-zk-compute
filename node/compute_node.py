@@ -7,9 +7,7 @@ from web3 import Web3, HTTPProvider
 from eth_account import Account
 from eth_account.signers.local import LocalAccount
 
-# ──────────────────────────────────────────────────────────────────────────────
 # ENV / CHAIN
-# ──────────────────────────────────────────────────────────────────────────────
 RPC_URL   = os.getenv("RPC_URL", "http://127.0.0.1:8545")
 ORCH_ADDR = os.getenv("ORCH_ADDR")
 PRIV      = os.getenv("PRIVATE_KEY")
@@ -38,7 +36,7 @@ def _env_artifact(*names: str, default: str) -> str:
     s = re.sub(r'\s+(?=[_/\.])|(?<=[_/\.])\s+', '', s)
     return s
 
-# Prefer ZK_* envs; fall back to ACC_*; finally fall back to defaults in ../circuits
+# Prefer ZK_* envs; fall back to ACC_*;
 ACC_WASM = _env_artifact(
     "ZK_ACC_WASM", "ACC_WASM",
     default="../circuits/MlpHoldoutAcc_256_js/MlpHoldoutAcc_256.wasm"
@@ -59,9 +57,7 @@ CLAIM_BURST = int(os.getenv("CLAIM_BURST", "3"))
 CLAIM_BURST_BACKOFF_MS = int(os.getenv("CLAIM_BURST_BACKOFF_MS", "200"))
 AUTO_WITHDRAW = os.getenv("AUTO_WITHDRAW", "1") == "1"
 
-# ──────────────────────────────────────────────────────────────────────────────
 # Utilities & PERF helpers
-# ──────────────────────────────────────────────────────────────────────────────
 REQUEST_T0 = time.perf_counter()   # request wall-time start (for this worker only)
 TASK_PERF: List[Dict[str, Any]] = []  # collects per-task timings for this worker
 
@@ -107,9 +103,7 @@ addr = acct.address
 ZERO = "0x0000000000000000000000000000000000000000"
 def eth(wei: int) -> str: return f"{w3.from_wei(int(wei), 'ether')} ETH"
 
-# ──────────────────────────────────────────────────────────────────────────────
-# MODEL 2→4→1 (int) — mirrors AiOrchestrator.sol
-# ──────────────────────────────────────────────────────────────────────────────
+# MODEL: mirrors AiOrchestrator.sol
 CAP_I = 127
 
 def lr_bucket(lr_ppm: int) -> int:
@@ -187,9 +181,7 @@ def accuracy_on(W: Tuple[int,...], xs0: List[int], xs1: List[int], ys: List[int]
         correct += int(forward(W, x0, x1) == y)
     return correct / len(xs0)
 
-# ──────────────────────────────────────────────────────────────────────────────
 # DATA & MERKLE (sorted‑pair). 0..15 JS‑half‑up quantization
-# ──────────────────────────────────────────────────────────────────────────────
 def quant01_to_q(v) -> int:
     f = Decimal(str(v).strip())
     if f < 0: f = Decimal(0)
@@ -256,9 +248,7 @@ def leaf_for_step(step_idx: int, ws: Tuple[int,...], we: Tuple[int,...]) -> byte
 def leaf_for_sample(idx: int, x0: int, x1: int, y: int) -> bytes:
     return h256(b32u(idx) + b32u(x0) + b32u(x1) + b32u(y))
 
-# ──────────────────────────────────────────────────────────────────────────────
 # TX helpers
-# ──────────────────────────────────────────────────────────────────────────────
 def _decode_error_string(data_hex: str):
     try:
         if not data_hex or not data_hex.startswith("0x"): return None
@@ -327,9 +317,7 @@ def send_tx(fn_call, *, value: int = 0, min_gas: int = 220_000, headroom_num: in
                 continue
             raise RuntimeError(msg) from e
 
-# ──────────────────────────────────────────────────────────────────────────────
 # MAIN
-# ──────────────────────────────────────────────────────────────────────────────
 print(f"[worker:{addr}] starting on request {REQ_ID}…")
 print(f"   using TRAIN_CSV={_resolve_csv(TRAIN_CSV)}")
 print(f"   using HOLD_CSV ={_resolve_csv(HOLD_CSV)}")
@@ -641,7 +629,6 @@ def do_task(idx: int, lr_ppm: int, steps: int):
         input_vec += x1_p                                        # x1_p[8]
         input_vec += y_p                                         # y_p[8]
 
-        # Debug mismatch (should not happen now that we stringify)
         mismatch_at = next((i for i, (a0, b0) in enumerate(zip(input_vec, public_signals)) if int(a0) != int(b0)), None)
         if mismatch_at is not None:
             lo = max(0, mismatch_at - 3)
@@ -769,9 +756,7 @@ def do_task(idx: int, lr_ppm: int, steps: int):
     })
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 # CLAIM/WORK LOOP
-# ──────────────────────────────────────────────────────────────────────────────
 while True:
     idx = None
     for attempt in range(CLAIM_BURST):
@@ -836,9 +821,7 @@ if AUTO_WITHDRAW and my_credit_before > 0:
     try: send_tx(orch.functions.withdraw(REQ_ID), min_gas=120_000)
     except Exception as e: print("   withdraw failed:", explain_web3_error(e))
 
-# ──────────────────────────────────────────────────────────────────────────────
 # END-OF-RUN: winners + performance summary
-# ──────────────────────────────────────────────────────────────────────────────
 try:
     space = orch.functions.getSpace(REQ_ID).call()
     n = len(space)

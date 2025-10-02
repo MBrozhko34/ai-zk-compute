@@ -2,8 +2,6 @@ pragma circom 2.1.6;
 
 include "circomlib/circuits/comparators.circom";
 
-// ───────────────── helpers ─────────────────
-
 template Boolify() {
     signal input  in;
     signal output out;
@@ -34,7 +32,7 @@ template StepNonNeg(nBits) {
     out      <== ge.out;
 }
 
-// ───────────────── 1-sample forward ─────────────────
+// 1-sample forward
 //
 // Flattened weight layout (17 params):
 // W1: [0..7]  (j*2 + {0,1})
@@ -313,8 +311,6 @@ template MlpAcc256_PackedInputs() {
     }
 }
 
-// IMPORTANT: Only *input* signals can be listed as public.
-// Arrays are allowed; this totals 67 public inputs.
 component main {
     public [ acc_bps, w_abs, w_sign, mask_p, x0_p, x1_p, y_p ]
 } = MlpAcc256_PackedInputs();

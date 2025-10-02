@@ -1,4 +1,3 @@
-// client/open_request.ts
 import { ethers, NonceManager } from "ethers";
 import * as dotenv from "dotenv";
 import * as fs from "fs";
@@ -11,14 +10,14 @@ const ORCH_ADDR   = process.env.ORCH_ADDR!;
 const RPC_URL     = process.env.RPC_URL!;
 const PK          = process.env.PRIVATE_KEY!;
 const TRAIN_CSV   = process.env.TRAIN_CSV   || "client/train.csv";
-const HOLDOUT_CSV = process.env.HOLDOUT_CSV || "client/dataset.csv";  // your bigger dataset
-const HOLDOUT_MODE = (process.env.HOLDOUT_MODE || "array").toLowerCase(); // "array" | "root"
+const HOLDOUT_CSV = process.env.HOLDOUT_CSV || "client/dataset.csv";
+const HOLDOUT_MODE = (process.env.HOLDOUT_MODE || "array").toLowerCase();
 
 if (!ORCH_ADDR || !ORCH_ADDR.startsWith("0x")) throw new Error(`ORCH_ADDR missing/malformed: ${ORCH_ADDR}`);
 if (!RPC_URL) throw new Error("RPC_URL missing");
 if (!PK)      throw new Error("PRIVATE_KEY missing");
 
-// ----- CSV → quantized arrays (x0,x1 in 0..15; y in {0,1})
+// quantized arrays (x0,x1 in 0..15; y in {0,1})
 function quant01ToQ(s: string): bigint {
   const v = Number.parseFloat(s);
   if (!Number.isFinite(v)) throw new Error(`bad float "${s}"`);
@@ -43,7 +42,7 @@ function loadCsvQuant(pathStr: string): { x0: bigint[]; x1: bigint[]; y: bigint[
 
     if (!seenHeader && isHeaderRow(cells)) { seenHeader = true; continue; }
 
-    // features as floats 0..1 → quantize to 0..15
+    // features as floats 0..1 quantize to 0..15
     try {
       const a = quant01ToQ(cells[0]);
       const b = quant01ToQ(cells[1]);
@@ -61,7 +60,7 @@ function loadCsvQuant(pathStr: string): { x0: bigint[]; x1: bigint[]; y: bigint[
   return { x0, x1, y };
 }
 
-// ----- Merkle (sorted-pair) exactly like contract: keccak( sorted(leafA, leafB) )
+// Merkle (sorted-pair) exactly like contract: keccak( sorted(leafA, leafB) )
 function leafForSample(idx: number, x0: bigint, x1: bigint, y: bigint): string {
   return ethers.solidityPackedKeccak256(
     ["uint256","uint256","uint256","uint256"],
@@ -95,9 +94,7 @@ function merkleRootSorted(leaves: string[]): string {
   const managed  = new NonceManager(wallet);
   const orch     = new ethers.Contract(ORCH_ADDR, OrchAbi.abi, managed);
 
-  // ---- Bigger hyper-parameter grid (edit as you like)
   const grid: Array<{ lr: bigint | number; steps: bigint | number }> = [
-    // lr in ppm (will bucket on-chain), moderate step counts
     { lr:  5_000,  steps:  50 }, { lr:  5_000,  steps: 150 }, { lr:  5_000,  steps: 300 },
     { lr: 20_000,  steps:  50 }, { lr: 20_000,  steps: 150 }, { lr: 20_000,  steps: 300 },
     { lr: 40_000,  steps:  50 }, { lr: 40_000,  steps: 150 }, { lr: 40_000,  steps: 300 },
@@ -130,7 +127,7 @@ function merkleRootSorted(leaves: string[]): string {
   }
   console.log("request id", id.toString());
 
-  // ---- Training commitment (R0)
+  // Training commitment (R0)
   const tr = loadCsvQuant(TRAIN_CSV);
   const trLeaves = tr.x0.map((_, i) => leafForSample(i, tr.x0[i], tr.x1[i], tr.y[i]));
   const trRoot = merkleRootSorted(trLeaves);
@@ -138,7 +135,7 @@ function merkleRootSorted(leaves: string[]): string {
   await (await orch.setTrainingDatasetRoot(id, trRoot, tr.x0.length)).wait();
   console.log("✓ training root set");
 
-  // ---- Hold-out (array mode by default; or Merkle root if HOLDOUT_MODE=root)
+  // Hold-out
   const te = loadCsvQuant(HOLDOUT_CSV);
   console.log(`hold-out set has ${te.x0.length} rows (${HOLDOUT_MODE} mode)`);
 
