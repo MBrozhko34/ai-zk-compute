@@ -29,6 +29,7 @@ The project codebase includes:
 - circom 2.1.x (install via Cargo - see below)
 - snarkjs 0.6.x (see below for installation instructions)
 - ts-node 10.x (see below for installation instructions)
+- ptau file for zk
 
 circom (via cargo -> First Install Rust):
 - cargo install --locked --git https://github.com/iden3/circom
