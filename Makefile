@@ -153,6 +153,16 @@ endef
 
 .PHONY: workers-3 workers-6 workers-9 workers-12 stop-workers
 
+workers-1:
+	@echo "▶ Spawning 3 workers for REQUEST_ID=$(REQUEST_ID)"; \
+	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK2) & \
+	wait; echo "workers-1 finished"
+
+workers-1-2:
+	@echo "▶ Spawning 3 workers for REQUEST_ID=$(REQUEST_ID)"; \
+	$(MAKE) --no-print-directory worker REQUEST_ID=$(REQUEST_ID) PRIVATE_KEY=$(PK3) & \
+	wait; echo "workers-1 finished"
+
 # Spawn 3 workers (accounts #2..#4)
 workers-3:
 	$(call _require_rid)
