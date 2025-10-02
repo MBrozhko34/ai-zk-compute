@@ -5,10 +5,6 @@ import * as path from "path";
 import * as dotenv from "dotenv";
 dotenv.config();
 
-/**
- * Resolve the Groth16 verifier artifact regardless of the contract name
- * that snarkjs emitted (e.g., "Groth16Verifier" vs "Verifier").
- */
 async function getVerifierFactory(signer: any) {
   // Try the most common fully-qualified & bare names first.
   const candidates = [
@@ -81,14 +77,14 @@ async function main() {
   const verifier = await Verifier.deploy({ nonce: baseNonce });
   await verifier.waitForDeployment();
   const verifierAddr = await verifier.getAddress();
-  console.log("Verifier →", verifierAddr);
+  console.log("Verifier: ", verifierAddr);
 
   /* 3. AiOrchestrator (nonce = baseNonce + 1) */
   const Orch = await hre.ethers.getContractFactory("AiOrchestrator", wallet);
   const orch = await Orch.deploy(verifierAddr, { nonce: baseNonce + 1 });
   await orch.waitForDeployment();
   const orchAddr = await orch.getAddress();
-  console.log("Orchestrator →", orchAddr);
+  console.log("Orchestrator: ", orchAddr);
 
   /* 4. reminder */
   console.log(`\nAdd to .env:\nORCH_ADDR=${orchAddr}\n`);

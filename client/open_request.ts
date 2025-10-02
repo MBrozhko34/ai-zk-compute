@@ -26,7 +26,6 @@ function quant01ToQ(s: string): bigint {
   return BigInt(q);
 }
 function isHeaderRow(cells: string[]): boolean {
-  // treat row as header if any of the first 3 cells is not a number
   return cells.slice(0, 3).some((c) => Number.isNaN(Number.parseFloat(c)));
 }
 function loadCsvQuant(pathStr: string): { x0: bigint[]; x1: bigint[]; y: bigint[] } {
@@ -42,7 +41,6 @@ function loadCsvQuant(pathStr: string): { x0: bigint[]; x1: bigint[]; y: bigint[
 
     if (!seenHeader && isHeaderRow(cells)) { seenHeader = true; continue; }
 
-    // features as floats 0..1 quantize to 0..15
     try {
       const a = quant01ToQ(cells[0]);
       const b = quant01ToQ(cells[1]);
@@ -133,7 +131,7 @@ function merkleRootSorted(leaves: string[]): string {
   const trRoot = merkleRootSorted(trLeaves);
   console.log(`training set: len=${tr.x0.length} root=${trRoot}`);
   await (await orch.setTrainingDatasetRoot(id, trRoot, tr.x0.length)).wait();
-  console.log("✓ training root set");
+  console.log("training root set");
 
   // Hold-out
   const te = loadCsvQuant(HOLDOUT_CSV);
@@ -142,7 +140,7 @@ function merkleRootSorted(leaves: string[]): string {
   const teLeaves = te.x0.map((_, i) => leafForSample(i, te.x0[i], te.x1[i], te.y[i]));
   const teRoot = merkleRootSorted(teLeaves);
   await (await orch.setHoldoutDatasetRoot(id, teRoot, te.x0.length)).wait();
-  console.log("✓ hold-out root set");
+  console.log("hold-out root set");
 })().catch((e) => {
   console.error(e?.info?.error?.message || e?.shortMessage || e);
   process.exitCode = 1;

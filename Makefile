@@ -104,7 +104,7 @@ worker:
 
 
 startup: clear clean mlp-zk nde
-	@echo "startup complete: ran 'clear' → 'clean' → 'mlp-zk' → 'nde'"
+	@echo "startup complete: ran 'clear', 'clean', 'mlp-zk', 'nde'"
 
 run: depl req
 	$(MAKE) REQ_ID=0 workers-12

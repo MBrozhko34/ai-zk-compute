@@ -73,7 +73,7 @@ Make sure `pnpm` and `.cargo/bin` directories are in your executable PATH.
 - client/
   - open_request.ts               # opens a request with a hyper-parameter grid
 - node/
-  - compute_node.py               # worker: claim → train → prove → submit
+  - compute_node.py               # worker: claim, train, prove, submit
 - Makefile
 - .env
 
