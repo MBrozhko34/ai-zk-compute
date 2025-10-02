@@ -45,16 +45,16 @@ Make sure `pnpm` and `.cargo/bin` directories are in your executable PATH.
 ### Execute
 
 - Open terminal window, navigate to the project directory and execute
+  - `make clean` to reset your environment to the initial state (if necessary)
   - `make deps` to prepare the environment
   - `make startup` to compile contracts and launch blockhain nodes locally.
 - Open another terminal window in the project directory and execute `make run` to compile off-chain workers, deploy contract onto the (local) blockchain, and submit sample ML training request.
 
 ## Makefile targets
 
-- make startup              # clean and (re-) compile blockchain side, start blockchain nodes
+- make startup              # compile blockchain side, start blockchain nodes
 - make run                  # deploy contract on the node, submit sample request
-- make clear                # remove circuit artifacts + verifier (fresh rebuild)
-- make clean                # remove all compile artefacts
+- make clean                # remove all compiler artefacts and environment configuration
 - make mlp-zk               # compile ZK-proofs module
 - make nde                  # compile contracts and start hardhat node
 - make depl                 # deploy to localhost

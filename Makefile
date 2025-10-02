@@ -1,20 +1,22 @@
 -include .env
 
 # General / deps
-.PHONY: deps clear clean nde depl req exp worker zk-ptau mlp-zk
+.PHONY: deps clean nde depl req exp worker zk-ptau mlp-zk
 
 deps:
+	rm -rf node/.venv node/tmp
 	cd node && python -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
 
-clear:
-	pnpm hardhat clean
-	rm -rf circuits/XorCircuit_js circuits/*.zkey circuits/*.r1cs circuits/*.sym \
-	       contracts/Groth16Verifier.sol contracts/PlonkVerifier.sol \
-	       zk/* contracts/AccVerifier.sol
+clean-python:
+	rm -rf node/.venv node/tmp
 
 clean:
 	# Hardhat artifacts/cache
 	-pnpm hardhat clean
+
+	rm -rf circuits/XorCircuit_js circuits/*.zkey circuits/*.r1cs circuits/*.sym \
+	       contracts/Groth16Verifier.sol contracts/PlonkVerifier.sol \
+	       zk/* contracts/AccVerifier.sol
 
 	# --- Circom build outputs (safe: does NOT touch *.circom or *.ptau) ---
 	# wasm dirs created by circom (e.g., XorCircuit_js, MlpHoldoutAcc_256_js)
@@ -103,13 +105,14 @@ worker:
 		.venv/bin/python compute_node.py
 
 
-startup: clear clean mlp-zk nde
-	@echo "startup complete: ran 'clear', 'clean', 'mlp-zk', 'nde'"
+setup: clean deps
+
+startup: mlp-zk nde
+	@echo "startup complete: ran 'mlp-zk', 'nde'"
 
 run: depl req
 	$(MAKE) REQ_ID=0 workers-12
 
-tidy: clear clean
 
 REQUEST_ID ?= $(REQ_ID)
 
